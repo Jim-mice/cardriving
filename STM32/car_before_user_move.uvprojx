@@ -394,7 +394,7 @@
             <File>
               <FileName>main.c</FileName>
               <FileType>1</FileType>
-              <FilePath>.\User\main.c</FilePath>
+              <FilePath>.\main.c</FilePath>
             </File>
             <File>
               <FileName>system_stm32f10x.c</FileName>
