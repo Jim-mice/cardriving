@@ -1,0 +1,24 @@
+# 编译产物
+*.o
+*.obj
+*.elf
+*.hex
+*.bin
+*.map
+
+# Keil
+Objects/
+Listings/
+*.uvguix.*
+*.uvoptx
+
+# VSCode
+.vscode/
+
+# 临时文件
+*.log
+*.tmp
+
+# Windows
+Thumbs.db
+Desktop.ini
