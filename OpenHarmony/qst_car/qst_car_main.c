@@ -8,6 +8,7 @@
 #include "task10_servo_distance.h"
 #include "task10_trace.h"
 #include "task_ir.h"
+#include "task_oled.h"
 
 
 static void QstCarTask(void)
@@ -21,6 +22,7 @@ static void QstCarTask(void)
     Task10ServoDistanceInit();
     Task10TraceInit();
     TaskIrInit();
+    TaskOledInit();
 
     printf("Peripheral init done\r\n");
 
