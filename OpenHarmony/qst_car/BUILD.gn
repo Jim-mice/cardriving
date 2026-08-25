@@ -12,7 +12,9 @@ static_library("qst_car") {
         "src/task10_trace.c",
         "src/task_ir.c",
         "src/task_oled.c",
+        "src/task_sht20.c",
         "src/hal_bsp_ssd1306.c",
+        "src/hal_bsp_sht20.c",
         "src/trace_model.c",
         "src/uart_task9.c",
     ]
