@@ -4,6 +4,7 @@
 #include "cmsis_os2.h"
 #include "hal_bsp_ssd1306.h"
 #include "task_ap3216.h"
+#include "task_hcsr04.h"
 #include "task_oled.h"
 #include "task_sht20.h"
 #include "wifiiot_gpio.h"
@@ -14,19 +15,21 @@
 
 static void OledShowStatus(WifiIotGpioValue left, WifiIotGpioValue right,
     float temperature, float humidity, int envValid, uint16_t light,
-    uint16_t ir, uint16_t proximity, int ap3216Valid)
+    uint16_t ir, uint16_t proximity, int ap3216Valid, Hcsr04Angle angle,
+    float distance, int hcsr04Valid)
 {
     uint8_t title[] = "QST CAR";
-    uint8_t leftLine[] = "IR left: 0";
-    uint8_t rightLine[] = "IR right: 0";
+    uint8_t irGpioLine[] = "IR L:0 R:0";
     uint8_t temperatureLine[20] = "T: --.-- C";
     uint8_t humidityLine[20] = "H: --.-- %";
     uint8_t lightLine[16] = "L: ----";
     uint8_t irLine[16] = "IR: ----";
     uint8_t proximityLine[16] = "P: ----";
+    uint8_t hcsr04Line[24] = "A:-- D:--";
+    const char *angleName = "--";
 
-    leftLine[sizeof(leftLine) - 2] = (uint8_t)('0' + left);
-    rightLine[sizeof(rightLine) - 2] = (uint8_t)('0' + right);
+    irGpioLine[5] = (uint8_t)('0' + left);
+    irGpioLine[9] = (uint8_t)('0' + right);
     if (envValid != 0) {
         (void)snprintf((char *)temperatureLine, sizeof(temperatureLine),
             "T: %.2f C", (double)temperature);
@@ -41,16 +44,32 @@ static void OledShowStatus(WifiIotGpioValue left, WifiIotGpioValue right,
         (void)snprintf((char *)proximityLine, sizeof(proximityLine), "P: %u",
             (unsigned int)proximity);
     }
+    if (hcsr04Valid != 0) {
+        if (angle == HCSR04_ANGLE_LEFT) {
+            angleName = "left";
+        } else if (angle == HCSR04_ANGLE_MIDDLE) {
+            angleName = "middle";
+        } else if (angle == HCSR04_ANGLE_RIGHT) {
+            angleName = "right";
+        }
+        if (distance < 0.0f) {
+            (void)snprintf((char *)hcsr04Line, sizeof(hcsr04Line),
+                "A:%s D:no echo", angleName);
+        } else {
+            (void)snprintf((char *)hcsr04Line, sizeof(hcsr04Line),
+                "A:%s D:%.2f", angleName, (double)distance);
+        }
+    }
 
     SSD1306_CLS();
     SSD1306_ShowStr(0, 0, title, 8);
-    SSD1306_ShowStr(0, 1, leftLine, 8);
-    SSD1306_ShowStr(0, 2, rightLine, 8);
-    SSD1306_ShowStr(0, 3, temperatureLine, 8);
-    SSD1306_ShowStr(0, 4, humidityLine, 8);
-    SSD1306_ShowStr(0, 5, lightLine, 8);
-    SSD1306_ShowStr(0, 6, irLine, 8);
-    SSD1306_ShowStr(0, 7, proximityLine, 8);
+    SSD1306_ShowStr(0, 1, irGpioLine, 8);
+    SSD1306_ShowStr(0, 2, temperatureLine, 8);
+    SSD1306_ShowStr(0, 3, humidityLine, 8);
+    SSD1306_ShowStr(0, 4, lightLine, 8);
+    SSD1306_ShowStr(0, 5, irLine, 8);
+    SSD1306_ShowStr(0, 6, proximityLine, 8);
+    SSD1306_ShowStr(0, 7, hcsr04Line, 8);
 }
 
 static void OledTask(void *argument)
@@ -62,8 +81,11 @@ static void OledTask(void *argument)
     uint16_t light = 0;
     uint16_t ir = 0;
     uint16_t proximity = 0;
+    Hcsr04Angle angle = HCSR04_ANGLE_MIDDLE;
+    float distance = 0.0f;
     int envValid;
     int ap3216Valid;
+    int hcsr04Valid;
     (void)argument;
 
     if (SSD1306_Init() != 0) {
@@ -76,8 +98,9 @@ static void OledTask(void *argument)
             GpioGetInputVal(OLED_IR_RIGHT_GPIO, &right) == 0) {
             envValid = TaskSht20GetLatest(&temperature, &humidity);
             ap3216Valid = TaskAp3216GetLatest(&light, &ir, &proximity);
+            hcsr04Valid = TaskHcsr04GetLatest(&angle, &distance);
             OledShowStatus(left, right, temperature, humidity, envValid,
-                light, ir, proximity, ap3216Valid);
+                light, ir, proximity, ap3216Valid, angle, distance, hcsr04Valid);
         }
         osDelay(OLED_REFRESH_PERIOD_MS);
     }
