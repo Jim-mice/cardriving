@@ -11,6 +11,7 @@
 #include "task_oled.h"
 #include "task_sht20.h"
 #include "task_ap3216.h"
+#include "task_wifi.h"
 
 
 static void QstCarTask(void)
@@ -18,6 +19,7 @@ static void QstCarTask(void)
     printf("QST car start\r\n");
 
     Peripheral_Init();
+    TaskWifiInit();
 
     /* UART2 is initialized by Peripheral_Init before its RX tasks start. */
     UartTask9Init();

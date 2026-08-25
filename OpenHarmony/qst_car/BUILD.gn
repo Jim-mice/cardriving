@@ -2,6 +2,8 @@ static_library("qst_car") {
 
     sources = [
         "qst_car_main.c",
+        "src/task_wifi.c",
+        "src/wifi_connect.c",
 
         "src/Peripheral.c",
         "src/robot_hcsr04.c",
@@ -32,6 +34,8 @@ static_library("qst_car") {
 
         # WifiIot APIs, including UartRead/UartWrite declarations
         "//base/iot_hardware/interfaces/kits/wifiiot_lite",
+        "//foundation/communication/interfaces/kits/wifi_lite/wifiservice",
+        "//vendor/hisi/hi3861/hi3861/third_party/lwip_sack/include",
 
         # MQTT
         "//third_party/paho_mqtt/MQTTClient/src",
