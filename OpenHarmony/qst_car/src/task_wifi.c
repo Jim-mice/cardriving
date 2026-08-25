@@ -13,20 +13,33 @@
 
 static volatile int g_wifiConnectFinished;
 
+static void PrintIpv4Address(const char *name, const ip4_addr_t *address)
+{
+    printf("%s: %u.%u.%u.%u\r\n", name, (unsigned int)ip4_addr1(address),
+        (unsigned int)ip4_addr2(address), (unsigned int)ip4_addr3(address),
+        (unsigned int)ip4_addr4(address));
+}
+
 static void PrintWifiIp(void)
 {
     struct netif *netif = netifapi_netif_find("wlan0");
-    const ip4_addr_t *ip;
+    ip4_addr_t ip = {0};
+    ip4_addr_t mask = {0};
+    ip4_addr_t gateway = {0};
 
     if (netif == NULL) {
         printf("ip: unavailable\r\n");
         return;
     }
 
-    ip = netif_ip4_addr(netif);
-    printf("ip: %u.%u.%u.%u\r\n", (unsigned int)ip4_addr1(ip),
-        (unsigned int)ip4_addr2(ip), (unsigned int)ip4_addr3(ip),
-        (unsigned int)ip4_addr4(ip));
+    if (netifapi_netif_get_addr(netif, &ip, &mask, &gateway) != ERR_OK) {
+        printf("ip: unavailable\r\n");
+        return;
+    }
+
+    PrintIpv4Address("ip", &ip);
+    PrintIpv4Address("mask", &mask);
+    PrintIpv4Address("gateway", &gateway);
 }
 
 static void WifiConnectTask(void *argument)

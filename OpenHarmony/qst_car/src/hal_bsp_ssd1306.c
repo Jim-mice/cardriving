@@ -26,13 +26,49 @@ static uint32_t SSD1306_SendData(uint8_t *data, size_t size)
 static uint32_t SSD1306_WriteCmd(uint8_t byte)
 {
   uint8_t buffer[] = {0x00, byte};
-  return SSD1306_SendData(buffer, sizeof(buffer));
+  uint32_t result = SSD1306_SendData(buffer, sizeof(buffer));
+
+  if (result != 0) {
+    printf("SSD1306 cmd write failed: cmd=0x%02X, err=0x%08X\r\n", byte, result);
+  }
+  return result;
 }
 // 写数据
 static uint32_t SSD1306_WiteData(uint8_t byte)
 {
   uint8_t buffer[] = {0x40, byte};
-  return SSD1306_SendData(buffer, sizeof(buffer));
+  uint32_t result = SSD1306_SendData(buffer, sizeof(buffer));
+
+  if (result != 0) {
+    printf("SSD1306 data write failed: data=0x%02X, err=0x%08X\r\n", byte, result);
+  }
+  return result;
+}
+
+/*
+ * Send display RAM data using one I2C transaction per chunk.  The SSD1306
+ * control byte 0x40 selects a following stream of data bytes.
+ */
+static uint32_t SSD1306_WriteDataBuf(const uint8_t *data, uint16_t len)
+{
+  uint8_t buffer[129];
+  uint16_t chunk;
+  uint32_t result;
+
+  while (len > 0) {
+    chunk = (len > 128) ? 128 : len;
+    buffer[0] = 0x40;
+    (void)memcpy(&buffer[1], data, chunk);
+    result = SSD1306_SendData(buffer, (size_t)chunk + 1);
+    if (result != 0) {
+      printf("SSD1306 data buffer write failed: len=%u, err=0x%08X\r\n", chunk, result);
+      return result;
+    }
+    data += chunk;
+    len -= chunk;
+  }
+
+  return 0;
 }
 
 uint32_t SSD1306_Init(void)
@@ -71,8 +107,8 @@ uint32_t SSD1306_Init(void)
   SSD1306_WriteCmd(0xff); //亮度调节 0x00~0xff
   SSD1306_WriteCmd(0xa1); //--set segment re-map 0 to 127
   SSD1306_WriteCmd(0xa6); //--set normal display
-  SSD1306_WriteCmd(0xa8); //--set multiplex ratio(1 to 64)
-  SSD1306_WriteCmd(0x3F); //
+  SSD1306_WriteCmd(0xa8); //--set multiplex ratio for 128x32 panel
+  SSD1306_WriteCmd(0x1F);
   SSD1306_WriteCmd(0xa4); //0xa4,Output follows RAM content;0xa5,Output ignores RAM content
   SSD1306_WriteCmd(0xd3); //-set display offset
   SSD1306_WriteCmd(0x00); //-not offset
@@ -80,8 +116,8 @@ uint32_t SSD1306_Init(void)
   SSD1306_WriteCmd(0xf0); //--set divide ratio
   SSD1306_WriteCmd(0xd9); //--set pre-charge period
   SSD1306_WriteCmd(0x22); //
-  SSD1306_WriteCmd(0xda); //--set com pins hardware configuration
-  SSD1306_WriteCmd(0x12);
+  SSD1306_WriteCmd(0xda); //--set com pins hardware configuration for 128x32 panel
+  SSD1306_WriteCmd(0x02);
   SSD1306_WriteCmd(0xdb); //--set vcomh
   SSD1306_WriteCmd(0x20); //0x20,0.77xVcc
   SSD1306_WriteCmd(0x8d); //--set DC-DC enable
@@ -127,9 +163,9 @@ void SSD1306_SetPos(uint8_t x, uint8_t y) //设置起始点坐标
 void SSD1306_Fill(uint8_t fill_Data) //全屏填充
 {
   unsigned char m, n;
-  for (m = 0; m < 8; m++)
+  for (m = 0; m < 4; m++)
   {
-    SSD1306_WriteCmd(0xb0 + m); //page0-page1
+    SSD1306_WriteCmd(0xb0 + m); //page 0-page 3
     SSD1306_WriteCmd(0x00);     //low column start address
     SSD1306_WriteCmd(0x10);     //high column start address
     for (n = 0; n < 128; n++)
@@ -181,7 +217,7 @@ void SSD1306_OFF(void)
  */
 void SSD1306_ShowStr(uint8_t x, uint8_t y, uint8_t ch[], uint8_t TextSize)
 {
-  unsigned char c = 0, i = 0, j = 0;
+  unsigned char c = 0, j = 0;
   switch (TextSize)
   {
   case 8:
@@ -195,8 +231,7 @@ void SSD1306_ShowStr(uint8_t x, uint8_t y, uint8_t ch[], uint8_t TextSize)
         y++;
       }
       SSD1306_SetPos(x, y);
-      for (i = 0; i < 6; i++)
-        SSD1306_WiteData(F6x8[c][i]);
+      (void)SSD1306_WriteDataBuf(F6x8[c], 6);
       x += 6;
       j++;
     }
@@ -214,11 +249,9 @@ void SSD1306_ShowStr(uint8_t x, uint8_t y, uint8_t ch[], uint8_t TextSize)
         y++;
       }
       SSD1306_SetPos(x, y);
-      for (i = 0; i < 8; i++)
-        SSD1306_WiteData(F8X16[c * 16 + i]);
+      (void)SSD1306_WriteDataBuf(&F8X16[c * 16], 8);
       SSD1306_SetPos(x, y + 1);
-      for (i = 0; i < 8; i++)
-        SSD1306_WiteData(F8X16[c * 16 + i + 8]);
+      (void)SSD1306_WriteDataBuf(&F8X16[c * 16 + 8], 8);
       x += 8;
       j++;
     }

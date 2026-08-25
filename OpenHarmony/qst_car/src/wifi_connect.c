@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include <unistd.h>
 
 #include "lwip/netif.h"
@@ -15,6 +16,8 @@
 
 #define DEF_TIMEOUT 15
 #define ONE_SECOND 1
+#define WIFI_SCAN_RETRY_MAX 3
+#define WIFI_SCAN_RETRY_DELAY_MS 2000
 
 #define SELECT_WIFI_SECURITYTYPE WIFI_SEC_TYPE_PSK  
 
@@ -40,6 +43,9 @@ int WifiConnect(const char *ssid, const char *psk)
     WifiScanInfo *info = NULL;
     unsigned int size = WIFI_SCAN_HOTSPOT_LIMIT;
     static struct netif *g_lwip_netif = NULL;
+    WifiErrorCode enableRet;
+    unsigned int retryCount = 0;
+    int selectedIndex = -1;
 
     osDelay(200);
     printf("<--System Init-->\r\n");
@@ -48,9 +54,10 @@ int WifiConnect(const char *ssid, const char *psk)
     WiFiInit();
 
     //使能WIFI
-    if (EnableWifi() != WIFI_SUCCESS)
+    enableRet = EnableWifi();
+    if (enableRet != WIFI_SUCCESS)
     {
-        printf("EnableWifi failed, error = %d\r\n", error);
+        printf("EnableWifi failed, ret=%d\r\n", enableRet);
         return -1;
     }
 
@@ -67,11 +74,12 @@ int WifiConnect(const char *ssid, const char *psk)
     {
         return -1;
     }
-    //轮询查找WiFi列表
-    do{
+    // Scan until the requested SSID is found, with at most three retries.
+    while (selectedIndex < 0) {
         //重置标志位
         ssid_count = 0;
         g_staScanSuccess = 0;
+        size = WIFI_SCAN_HOTSPOT_LIMIT;
 
         //开始扫描
         Scan();
@@ -79,48 +87,52 @@ int WifiConnect(const char *ssid, const char *psk)
         //等待扫描结果
         WaitSacnResult();
 
-        //获取扫描列表
-        error = GetScanInfoList(info, &size);
-
-    }while(g_staScanSuccess != 1);
-    //打印WiFi列表
-    printf("********************\r\n");
-    for(uint8_t i = 0; i < ssid_count; i++)
-    {
-        printf("no:%03d, ssid:%-30s, rssi:%5d\r\n", i+1, info[i].ssid, info[i].rssi/100);
-    }
-    printf("********************\r\n");
-    
-    //连接指定的WiFi热点
-    for(uint8_t i = 0; i < ssid_count; i++)
-    {
-        if (strcmp(ssid, info[i].ssid) == 0)
-        {
-            int result;
-
-            printf("Select:%3d wireless, Waiting...\r\n", i+1);
-
-            //拷贝要连接的热点信息
-            WifiDeviceConfig select_ap_config = {0};
-            strcpy(select_ap_config.ssid, info[i].ssid);
-            strcpy(select_ap_config.preSharedKey, psk);
-            select_ap_config.securityType = SELECT_WIFI_SECURITYTYPE;
-
-            if (AddDeviceConfig(&select_ap_config, &result) == WIFI_SUCCESS)
-            {
-                if (ConnectTo(result) == WIFI_SUCCESS && WaitConnectResult() == 1)
-                {
-                    printf("WiFi connect succeed!\r\n");
-                    g_lwip_netif = netifapi_netif_find(SELECT_WLAN_PORT);
-                    break;
+        if (g_staScanSuccess == 1) {
+            //获取扫描列表
+            error = GetScanInfoList(info, &size);
+            if (error == WIFI_SUCCESS) {
+                //打印WiFi列表
+                printf("********************\r\n");
+                for (uint8_t i = 0; i < ssid_count; i++) {
+                    printf("no:%03d, ssid:%-30s, rssi:%5d\r\n", i + 1, info[i].ssid, info[i].rssi / 100);
+                    if (strcmp(ssid, info[i].ssid) == 0) {
+                        selectedIndex = (int)i;
+                    }
                 }
+                printf("********************\r\n");
             }
         }
 
-        if(i == ssid_count-1)
-        {
+        if (selectedIndex >= 0) {
+            break;
+        }
+        if (retryCount >= WIFI_SCAN_RETRY_MAX) {
             printf("ERROR: No wifi as expected\r\n");
-            while(1) osDelay(100);
+            free(info);
+            return -1;
+        }
+        retryCount++;
+        printf("WiFi scan retry %u/%u\r\n", retryCount, WIFI_SCAN_RETRY_MAX);
+        osDelay(WIFI_SCAN_RETRY_DELAY_MS);
+    }
+    
+    //连接指定的WiFi热点
+    {
+        int result;
+
+        printf("Select:%3d wireless, Waiting...\r\n", selectedIndex + 1);
+
+        //拷贝要连接的热点信息
+        WifiDeviceConfig select_ap_config = {0};
+        strcpy(select_ap_config.ssid, info[selectedIndex].ssid);
+        strcpy(select_ap_config.preSharedKey, psk);
+        select_ap_config.securityType = SELECT_WIFI_SECURITYTYPE;
+
+        if (AddDeviceConfig(&select_ap_config, &result) == WIFI_SUCCESS) {
+            if (ConnectTo(result) == WIFI_SUCCESS && WaitConnectResult() == 1) {
+                printf("WiFi connect succeed!\r\n");
+                g_lwip_netif = netifapi_netif_find(SELECT_WLAN_PORT);
+            }
         }
     }
      //启动DHCP

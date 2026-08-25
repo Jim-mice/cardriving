@@ -11,6 +11,7 @@
 #include "task_wifi.h"
 #include "task_hello.h"
 
+#define WIFI_STA_START_WAIT_MS 6000
 
 static void QstCarTask(void)
 {
@@ -18,6 +19,13 @@ static void QstCarTask(void)
 
     Peripheral_Init();
     TaskWifiInit();
+
+    /*
+     * WiFiConnectTask has below-normal priority.  Yield here so its
+     * EnableWifi() attempt runs before creating the remaining app tasks.
+     */
+    osDelay(WIFI_STA_START_WAIT_MS);
+
     TaskHelloInit();
 
     /* UART2 is initialized by Peripheral_Init before its RX tasks start. */

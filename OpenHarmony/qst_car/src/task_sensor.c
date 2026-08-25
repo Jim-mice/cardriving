@@ -28,52 +28,25 @@ static int g_sensorTaskStarted;
 
 static void OledShowStatus(WifiIotGpioValue left, WifiIotGpioValue right)
 {
-    uint8_t title[] = "QST CAR";
-    uint8_t irGpioLine[] = "IR L:0 R:0";
-    uint8_t temperatureLine[20] = "T: --.-- C";
-    uint8_t humidityLine[20] = "H: --.-- %";
-    uint8_t lightLine[16] = "L: ----";
-    uint8_t irLine[16] = "IR: ----";
-    uint8_t proximityLine[16] = "P: ----";
-    uint8_t hcsr04Line[24] = "A:-- D:--";
-    Hcsr04Angle angle = HCSR04_ANGLE_MIDDLE;
-    float distance = 0.0f;
-    const char *angleName = "--";
+    uint8_t temperatureLine[22];
+    uint8_t humidityLine[22];
+    uint8_t lightLine[22];
+    uint8_t irLine[22];
 
-    irGpioLine[5] = (uint8_t)('0' + left);
-    irGpioLine[9] = (uint8_t)('0' + right);
-    if (g_sht20DataValid != 0) {
-        (void)snprintf((char *)temperatureLine, sizeof(temperatureLine), "T: %.2f C", (double)g_temperature);
-        (void)snprintf((char *)humidityLine, sizeof(humidityLine), "H: %.2f %%", (double)g_humidity);
-    }
-    if (g_ap3216DataValid != 0) {
-        (void)snprintf((char *)lightLine, sizeof(lightLine), "L: %u", (unsigned int)g_light);
-        (void)snprintf((char *)irLine, sizeof(irLine), "IR: %u", (unsigned int)g_ir);
-        (void)snprintf((char *)proximityLine, sizeof(proximityLine), "P: %u", (unsigned int)g_proximity);
-    }
-    if (TaskHcsr04GetLatest(&angle, &distance) != 0) {
-        if (angle == HCSR04_ANGLE_LEFT) {
-            angleName = "left";
-        } else if (angle == HCSR04_ANGLE_MIDDLE) {
-            angleName = "middle";
-        } else if (angle == HCSR04_ANGLE_RIGHT) {
-            angleName = "right";
-        }
-        if (distance < 0.0f) {
-            (void)snprintf((char *)hcsr04Line, sizeof(hcsr04Line), "A:%s D:no echo", angleName);
-        } else {
-            (void)snprintf((char *)hcsr04Line, sizeof(hcsr04Line), "A:%s D:%.2f", angleName, (double)distance);
-        }
-    }
+    (void)left;
+    (void)right;
+
+    (void)snprintf((char *)temperatureLine, sizeof(temperatureLine), "Temp:%.2f C", (double)g_temperature);
+    (void)snprintf((char *)humidityLine, sizeof(humidityLine), "Hum:%.2f %%", (double)g_humidity);
+    (void)snprintf((char *)lightLine, sizeof(lightLine), "Light:%u", (unsigned int)g_light);
+    (void)snprintf((char *)irLine, sizeof(irLine), "IR:%u Pro:%u", (unsigned int)g_ir,
+        (unsigned int)g_proximity);
+
     SSD1306_CLS();
-    SSD1306_ShowStr(0, 0, title, 8);
-    SSD1306_ShowStr(0, 1, irGpioLine, 8);
-    SSD1306_ShowStr(0, 2, temperatureLine, 8);
-    SSD1306_ShowStr(0, 3, humidityLine, 8);
-    SSD1306_ShowStr(0, 4, lightLine, 8);
-    SSD1306_ShowStr(0, 5, irLine, 8);
-    SSD1306_ShowStr(0, 6, proximityLine, 8);
-    SSD1306_ShowStr(0, 7, hcsr04Line, 8);
+    SSD1306_ShowStr(0, 0, temperatureLine, 8);
+    SSD1306_ShowStr(0, 1, humidityLine, 8);
+    SSD1306_ShowStr(0, 2, lightLine, 8);
+    SSD1306_ShowStr(0, 3, irLine, 8);
 }
 
 static void SensorTask(void *argument)
