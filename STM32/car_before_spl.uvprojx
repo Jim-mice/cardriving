@@ -37,7 +37,7 @@
           <bCustSvd>0</bCustSvd>
           <UseEnv>0</UseEnv>
           <BinPath></BinPath>
-          <IncludePath>.\Core;.\Config;.\Libraries\CMSIS\Core\Include;.\Libraries\STM32F10x_Device\Include;.\Libraries\STM32F10x_StdPeriph_Driver\inc</IncludePath>
+          <IncludePath>.\Core;.\Config;.\Libraries\CMSIS\Core\Include;.\Libraries\STM32F10x_Device\Include</IncludePath>
           <LibPath></LibPath>
           <RegisterFilePath></RegisterFilePath>
           <DBRegisterFilePath></DBRegisterFilePath>
@@ -337,7 +337,7 @@
               <MiscControls></MiscControls>
               <Define>STM32F10X_MD,USE_STDPERIPH_DRIVER,HSE_VALUE=8000000</Define>
               <Undefine></Undefine>
-              <IncludePath>.\Core;.\Config;.\Libraries\CMSIS\Core\Include;.\Libraries\STM32F10x_Device\Include;.\Libraries\STM32F10x_StdPeriph_Driver\inc</IncludePath>
+              <IncludePath>.\Core;.\Config;.\Libraries\CMSIS\Core\Include;.\Libraries\STM32F10x_Device\Include</IncludePath>
             </VariousControls>
           </Cads>
           <Aads>
@@ -355,7 +355,7 @@
               <MiscControls></MiscControls>
               <Define>STM32F10X_MD,USE_STDPERIPH_DRIVER,HSE_VALUE=8000000</Define>
               <Undefine></Undefine>
-              <IncludePath>.\Core;.\Config;.\Libraries\CMSIS\Core\Include;.\Libraries\STM32F10x_Device\Include;.\Libraries\STM32F10x_StdPeriph_Driver\inc</IncludePath>
+              <IncludePath>.\Core;.\Config;.\Libraries\CMSIS\Core\Include;.\Libraries\STM32F10x_Device\Include</IncludePath>
             </VariousControls>
           </Aads>
           <LDads>
@@ -400,31 +400,6 @@
               <FileName>system_stm32f10x.c</FileName>
               <FileType>1</FileType>
               <FilePath>.\Core\system_stm32f10x.c</FilePath>
-            </File>
-          </Files>
-        </Group>
-        <Group>
-          <GroupName>StdPeriph</GroupName>
-          <Files>
-            <File>
-              <FileName>misc.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>.\Libraries\STM32F10x_StdPeriph_Driver\src\misc.c</FilePath>
-            </File>
-            <File>
-              <FileName>stm32f10x_gpio.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>.\Libraries\STM32F10x_StdPeriph_Driver\src\stm32f10x_gpio.c</FilePath>
-            </File>
-            <File>
-              <FileName>stm32f10x_rcc.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>.\Libraries\STM32F10x_StdPeriph_Driver\src\stm32f10x_rcc.c</FilePath>
-            </File>
-            <File>
-              <FileName>stm32f10x_usart.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>.\Libraries\STM32F10x_StdPeriph_Driver\src\stm32f10x_usart.c</FilePath>
             </File>
           </Files>
         </Group>
