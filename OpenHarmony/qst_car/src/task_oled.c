@@ -3,6 +3,7 @@
 
 #include "cmsis_os2.h"
 #include "hal_bsp_ssd1306.h"
+#include "task_ap3216.h"
 #include "task_oled.h"
 #include "task_sht20.h"
 #include "wifiiot_gpio.h"
@@ -12,13 +13,17 @@
 #define OLED_REFRESH_PERIOD_MS 500
 
 static void OledShowStatus(WifiIotGpioValue left, WifiIotGpioValue right,
-    float temperature, float humidity, int envValid)
+    float temperature, float humidity, int envValid, uint16_t light,
+    uint16_t ir, uint16_t proximity, int ap3216Valid)
 {
     uint8_t title[] = "QST CAR";
     uint8_t leftLine[] = "IR left: 0";
     uint8_t rightLine[] = "IR right: 0";
     uint8_t temperatureLine[20] = "T: --.-- C";
     uint8_t humidityLine[20] = "H: --.-- %";
+    uint8_t lightLine[16] = "L: ----";
+    uint8_t irLine[16] = "IR: ----";
+    uint8_t proximityLine[16] = "P: ----";
 
     leftLine[sizeof(leftLine) - 2] = (uint8_t)('0' + left);
     rightLine[sizeof(rightLine) - 2] = (uint8_t)('0' + right);
@@ -28,13 +33,24 @@ static void OledShowStatus(WifiIotGpioValue left, WifiIotGpioValue right,
         (void)snprintf((char *)humidityLine, sizeof(humidityLine),
             "H: %.2f %%", (double)humidity);
     }
+    if (ap3216Valid != 0) {
+        (void)snprintf((char *)lightLine, sizeof(lightLine), "L: %u",
+            (unsigned int)light);
+        (void)snprintf((char *)irLine, sizeof(irLine), "IR: %u",
+            (unsigned int)ir);
+        (void)snprintf((char *)proximityLine, sizeof(proximityLine), "P: %u",
+            (unsigned int)proximity);
+    }
 
     SSD1306_CLS();
-    SSD1306_ShowStr(0, 0, title, 16);
-    SSD1306_ShowStr(0, 2, leftLine, 8);
-    SSD1306_ShowStr(0, 3, rightLine, 8);
-    SSD1306_ShowStr(0, 4, temperatureLine, 8);
-    SSD1306_ShowStr(0, 5, humidityLine, 8);
+    SSD1306_ShowStr(0, 0, title, 8);
+    SSD1306_ShowStr(0, 1, leftLine, 8);
+    SSD1306_ShowStr(0, 2, rightLine, 8);
+    SSD1306_ShowStr(0, 3, temperatureLine, 8);
+    SSD1306_ShowStr(0, 4, humidityLine, 8);
+    SSD1306_ShowStr(0, 5, lightLine, 8);
+    SSD1306_ShowStr(0, 6, irLine, 8);
+    SSD1306_ShowStr(0, 7, proximityLine, 8);
 }
 
 static void OledTask(void *argument)
@@ -43,7 +59,11 @@ static void OledTask(void *argument)
     WifiIotGpioValue right;
     float temperature = 0.0f;
     float humidity = 0.0f;
+    uint16_t light = 0;
+    uint16_t ir = 0;
+    uint16_t proximity = 0;
     int envValid;
+    int ap3216Valid;
     (void)argument;
 
     if (SSD1306_Init() != 0) {
@@ -55,7 +75,9 @@ static void OledTask(void *argument)
         if (GpioGetInputVal(OLED_IR_LEFT_GPIO, &left) == 0 &&
             GpioGetInputVal(OLED_IR_RIGHT_GPIO, &right) == 0) {
             envValid = TaskSht20GetLatest(&temperature, &humidity);
-            OledShowStatus(left, right, temperature, humidity, envValid);
+            ap3216Valid = TaskAp3216GetLatest(&light, &ir, &proximity);
+            OledShowStatus(left, right, temperature, humidity, envValid,
+                light, ir, proximity, ap3216Valid);
         }
         osDelay(OLED_REFRESH_PERIOD_MS);
     }

@@ -10,6 +10,7 @@
 #include "task_ir.h"
 #include "task_oled.h"
 #include "task_sht20.h"
+#include "task_ap3216.h"
 
 
 static void QstCarTask(void)
@@ -24,6 +25,7 @@ static void QstCarTask(void)
     Task10TraceInit();
     TaskIrInit();
     TaskSht20Init();
+    TaskAp3216Init();
     TaskOledInit();
 
     printf("Peripheral init done\r\n");
