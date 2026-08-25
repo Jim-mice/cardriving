@@ -5,6 +5,7 @@
 #include "Peripheral.h"
 #include "wifi_connect.h"
 #include "uart_task9.h"
+#include "task10_servo_distance.h"
 
 
 static void QstCarTask(void)
@@ -15,6 +16,7 @@ static void QstCarTask(void)
 
     /* UART2 is initialized by Peripheral_Init before its RX tasks start. */
     UartTask9Init();
+    Task10ServoDistanceInit();
 
     printf("Peripheral init done\r\n");
 

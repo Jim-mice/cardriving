@@ -7,6 +7,7 @@ static_library("qst_car") {
         "src/robot_hcsr04.c",
         "src/robot_l9110s.c",
         "src/robot_sg90.c",
+        "src/task10_servo_distance.c",
         "src/trace_model.c",
         "src/uart_task9.c",
     ]
