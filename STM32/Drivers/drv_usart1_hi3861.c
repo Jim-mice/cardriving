@@ -1,11 +1,14 @@
 #include "drv_usart1_hi3861.h"
 #include "misc.h"
 
-uint8_t USART1_RX_Buffer[64];
+volatile uint8_t USART1_RX_Buffer[64];
 
 uint8_t USART1_RX_Index=0;
 
-uint8_t USART1_RX_Flag=0;
+volatile uint8_t USART1_RX_Flag=0;
+
+static uint8_t g_rxFrame[USART1_HI3861_FRAME_LEN];
+static uint8_t g_rxFrameIndex=0;
 
 
 
@@ -94,7 +97,7 @@ USART_Init(
 
 
 /*
- ø™∆ÙΩ” ’÷–∂œ
+ ÂºÄÂêØÊé•Êî∂‰∏≠Êñ≠
 */
 
 USART_ITConfig(
@@ -171,6 +174,30 @@ USART1_SendByte(
 
 
 
+uint8_t USART1_GetReceivedFrame(uint8_t *frame)
+{
+uint8_t index;
+
+if(USART1_RX_Flag==0)
+{
+return 0;
+}
+
+USART_ITConfig(USART1,USART_IT_RXNE,DISABLE);
+
+for(index=0;index<USART1_HI3861_FRAME_LEN;index++)
+{
+frame[index]=USART1_RX_Buffer[index];
+}
+
+USART1_RX_Flag=0;
+
+USART_ITConfig(USART1,USART_IT_RXNE,ENABLE);
+
+return 1;
+}
+
+
 void USART1_IRQHandler(void)
 {
 
@@ -192,34 +219,41 @@ USART1
 
 
 
-if(data=='\r' || data=='\n')
+/* ISR only frames bytes. Printing and application behavior stay in main(). */
+if(g_rxFrameIndex==0)
 {
+if(data==USART1_HI3861_FRAME_HEAD)
+{
+g_rxFrame[g_rxFrameIndex++]=data;
+}
+}
+else if(g_rxFrameIndex<(USART1_HI3861_FRAME_LEN-1))
+{
+g_rxFrame[g_rxFrameIndex++]=data;
+}
+else if(data==USART1_HI3861_FRAME_TAIL)
+{
+uint8_t index;
 
-USART1_RX_Buffer[
-USART1_RX_Index
-]=0;
+g_rxFrame[g_rxFrameIndex]=data;
 
+/* Keep the most recently completed frame for the foreground task. */
+for(index=0;index<USART1_HI3861_FRAME_LEN;index++)
+{
+USART1_RX_Buffer[index]=g_rxFrame[index];
+}
 
 USART1_RX_Flag=1;
-
-
-USART1_RX_Index=0;
-
+g_rxFrameIndex=0;
+}
+else if(data==USART1_HI3861_FRAME_HEAD)
+{
+g_rxFrame[0]=data;
+g_rxFrameIndex=1;
 }
 else
 {
-
-if(
-USART1_RX_Index<63)
-{
-
-USART1_RX_Buffer[
-USART1_RX_Index++
-]
-=data;
-
-}
-
+g_rxFrameIndex=0;
 }
 
 
@@ -231,4 +265,3 @@ USART_IT_RXNE
 }
 
 }
-
