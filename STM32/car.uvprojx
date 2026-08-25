@@ -337,7 +337,7 @@
               <MiscControls></MiscControls>
               <Define>STM32F10X_MD,USE_STDPERIPH_DRIVER,HSE_VALUE=8000000</Define>
               <Undefine></Undefine>
-              <IncludePath>.\Core;.\Config;.\Libraries\CMSIS\Core\Include;.\Libraries\STM32F10x_Device\Include;.\Libraries\STM32F10x_StdPeriph_Driver\inc</IncludePath>
+              <IncludePath>.\Core;.\Config;.\Libraries\CMSIS\Core\Include;.\Libraries\STM32F10x_Device\Include;.\Libraries\STM32F10x_StdPeriph_Driver\inc;.\BSP</IncludePath>
             </VariousControls>
           </Cads>
           <Aads>
@@ -425,6 +425,21 @@
               <FileName>stm32f10x_usart.c</FileName>
               <FileType>1</FileType>
               <FilePath>.\Libraries\STM32F10x_StdPeriph_Driver\src\stm32f10x_usart.c</FilePath>
+            </File>
+          </Files>
+        </Group>
+        <Group>
+          <GroupName>BSP</GroupName>
+          <Files>
+            <File>
+              <FileName>bsp_gpio.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\BSP\bsp_gpio.c</FilePath>
+            </File>
+            <File>
+              <FileName>bsp_gpio.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\BSP\bsp_gpio.h</FilePath>
             </File>
           </Files>
         </Group>
