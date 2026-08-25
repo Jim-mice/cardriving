@@ -19,15 +19,10 @@
 #define GPIOR 14
 #define GPIO_FUNC 0
 
-extern void stm32motor_control(uint8_t dir,uint8_t motorA,uint8_t motorB,int angle);   
-extern void car_backward(void);
 extern void car_forward(void);
 extern void car_left_tra(void);
 extern void car_right_tra(void);
 extern void car_stop(void);
-
-extern uint8_t sen_or_car_flag;   //0 传感器采集模式   1  小车模式
-extern unsigned char g_car_status;  
 
 WifiIotGpioValue io_status_left;
 WifiIotGpioValue io_status_right;
@@ -56,15 +51,7 @@ void timer1_callback(unsigned int arg)
     }
 }
 
-void trace_module(void)
-{  
-    while (1) { 
-        timer1_callback(0);   //扫描红外对管函数
-        if (sen_or_car_flag !=1 || g_car_status != 1) {            //标志位变化，跳出任务
-             printf("trace_module stop!\n");
-             car_stop();
-            break;
-        }
-        hi_sleep(30);
-    }
+void trace_module_once(void)
+{
+    timer1_callback(0);
 }
