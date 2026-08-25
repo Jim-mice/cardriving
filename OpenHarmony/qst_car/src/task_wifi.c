@@ -7,8 +7,8 @@
 #include "task_wifi.h"
 #include "wifi_connect.h"
 
-#define WIFI_STA_SSID       "SSID"
-#define WIFI_STA_PASSWORD   "PASSWORD"
+#define WIFI_STA_SSID       "hamster"
+#define WIFI_STA_PASSWORD   "12345678"
 #define WIFI_CONNECT_TIMEOUT_MS 60000
 
 static volatile int g_wifiConnectFinished;
