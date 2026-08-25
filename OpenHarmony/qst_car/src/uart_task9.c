@@ -10,6 +10,7 @@
 #define UART_FRAME_TAIL        0xFD
 #define UART_FRAME_LEN         6
 #define UART_TASK9_QUEUE_DEPTH 8
+#define UART_TASK9_LOG_PERIOD_MS 5000U
 
 typedef struct {
     uint8_t data[UART_FRAME_LEN];
@@ -68,11 +69,20 @@ static void UartRxThread(void *argument)
 static void UartMsgThread(void *argument)
 {
     UartTask9Message message;
+    uint32_t lastLogTick = 0;
+    uint32_t logPeriodTicks;
     (void)argument;
+
+    logPeriodTicks = UART_TASK9_LOG_PERIOD_MS * osKernelGetTickFreq() / 1000U;
 
     while (1) {
         if (osMessageQueueGet(g_uartTask9Queue, &message, NULL,
             osWaitForever) == osOK) {
+            uint32_t now = osKernelGetTickCount();
+            if (lastLogTick != 0U && (now - lastLogTick) < logPeriodTicks) {
+                continue;
+            }
+            lastLogTick = now;
             printf("UART RX:\r\n");
             printf("%02X %02X %02X %02X %02X %02X\r\n",
                 message.data[0], message.data[1], message.data[2],

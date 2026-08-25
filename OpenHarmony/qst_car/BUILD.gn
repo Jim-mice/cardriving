@@ -2,6 +2,7 @@ static_library("qst_car") {
 
     sources = [
         "qst_car_main.c",
+        "src/task_hello.c",
         "src/task_wifi.c",
         "src/wifi_connect.c",
 
@@ -17,6 +18,7 @@ static_library("qst_car") {
         "src/task_oled.c",
         "src/task_sht20.c",
         "src/task_ap3216.c",
+        "src/task_sensor.c",
         "src/hal_bsp_ssd1306.c",
         "src/hal_bsp_sht20.c",
         "src/hal_bsp_ap3216c.c",

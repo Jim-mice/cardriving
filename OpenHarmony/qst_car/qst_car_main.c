@@ -7,11 +7,9 @@
 #include "uart_task9.h"
 #include "task10_servo_distance.h"
 #include "task10_trace.h"
-#include "task_ir.h"
-#include "task_oled.h"
-#include "task_sht20.h"
-#include "task_ap3216.h"
+#include "task_sensor.h"
 #include "task_wifi.h"
+#include "task_hello.h"
 
 
 static void QstCarTask(void)
@@ -20,15 +18,13 @@ static void QstCarTask(void)
 
     Peripheral_Init();
     TaskWifiInit();
+    TaskHelloInit();
 
     /* UART2 is initialized by Peripheral_Init before its RX tasks start. */
     UartTask9Init();
     Task10ServoDistanceInit();
     Task10TraceInit();
-    TaskIrInit();
-    TaskSht20Init();
-    TaskAp3216Init();
-    TaskOledInit();
+    TaskSensorInit();
 
     printf("Peripheral init done\r\n");
 
