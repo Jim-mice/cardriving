@@ -7,6 +7,7 @@
 #include "uart_task9.h"
 #include "task10_servo_distance.h"
 #include "task10_trace.h"
+#include "task_ir.h"
 
 
 static void QstCarTask(void)
@@ -19,6 +20,7 @@ static void QstCarTask(void)
     UartTask9Init();
     Task10ServoDistanceInit();
     Task10TraceInit();
+    TaskIrInit();
 
     printf("Peripheral init done\r\n");
 

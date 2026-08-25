@@ -10,6 +10,7 @@ static_library("qst_car") {
         "src/task10_servo_distance.c",
         "src/task10_bluetooth.c",
         "src/task10_trace.c",
+        "src/task_ir.c",
         "src/trace_model.c",
         "src/uart_task9.c",
     ]
