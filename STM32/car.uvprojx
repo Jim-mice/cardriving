@@ -441,6 +441,26 @@
               <FileType>5</FileType>
               <FilePath>.\BSP\bsp_gpio.h</FilePath>
             </File>
+            <File>
+              <FileName>bsp_ws2812.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\BSP\bsp_ws2812.c</FilePath>
+            </File>
+            <File>
+              <FileName>bsp_ws2812.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\BSP\bsp_ws2812.h</FilePath>
+            </File>
+            <File>
+              <FileName>bsp_light.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\BSP\bsp_light.c</FilePath>
+            </File>
+            <File>
+              <FileName>bsp_light.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\BSP\bsp_light.h</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>

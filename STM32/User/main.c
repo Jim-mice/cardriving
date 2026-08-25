@@ -1,26 +1,52 @@
 #include "stm32f10x.h"
-#include "drv_usart1_hi3861.h"
+#include "bsp_ws2812.h"
+
+
+void delay(uint32_t t)
+{
+    while(t--);
+}
+
 
 
 int main(void)
 {
 
-    USART1_Hi3861_Init();
+    WS2812_FR_Init();
+
+    WS2812_BA_Init();
 
 
     while(1)
     {
 
-        USART1_SendString(
-            "STM32 USART1 OK\r\n"
-        );
+
+        int i;
 
 
-        for(
-            volatile int i=0;
-            i<500000;
-            i++
-        );
+        for(i=0;i<6;i++)
+        {
+
+            WS2812_FR_Show(
+                i,
+                255,
+                0,
+                0
+            );
+
+
+            WS2812_BA_Show(
+                5-i,
+                0,
+                0,
+                255
+            );
+
+
+            delay(3000000);
+
+        }
+
 
     }
 
