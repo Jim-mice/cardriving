@@ -133,12 +133,12 @@
             <UseExternalTool>0</UseExternalTool>
             <RunIndependent>0</RunIndependent>
             <UpdateFlashBeforeDebugging>1</UpdateFlashBeforeDebugging>
-            <Capability>0</Capability>
-            <DriverSelection>-1</DriverSelection>
+            <Capability>1</Capability>
+            <DriverSelection>4096</DriverSelection>
           </Flash1>
           <bUseTDR>1</bUseTDR>
           <Flash2>BIN\UL2CM3.DLL</Flash2>
-          <Flash3></Flash3>
+          <Flash3>"" ()</Flash3>
           <Flash4></Flash4>
           <pFcarmOut></pFcarmOut>
           <pFcarmGrp></pFcarmGrp>
@@ -337,7 +337,7 @@
               <MiscControls></MiscControls>
               <Define>STM32F10X_MD,USE_STDPERIPH_DRIVER,HSE_VALUE=8000000</Define>
               <Undefine></Undefine>
-              <IncludePath>.\Core;.\Config;.\Libraries\CMSIS\Core\Include;.\Libraries\STM32F10x_Device\Include;.\Libraries\STM32F10x_StdPeriph_Driver\inc;.\BSP</IncludePath>
+              <IncludePath>.\Core;.\Config;.\Libraries\CMSIS\Core\Include;.\Libraries\STM32F10x_Device\Include;.\Libraries\STM32F10x_StdPeriph_Driver\inc;.\BSP;.\Drivers</IncludePath>
             </VariousControls>
           </Cads>
           <Aads>
@@ -440,6 +440,21 @@
               <FileName>bsp_gpio.h</FileName>
               <FileType>5</FileType>
               <FilePath>.\BSP\bsp_gpio.h</FilePath>
+            </File>
+          </Files>
+        </Group>
+        <Group>
+          <GroupName>Drivers</GroupName>
+          <Files>
+            <File>
+              <FileName>drv_usart1_hi3861.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\Drivers\drv_usart1_hi3861.c</FilePath>
+            </File>
+            <File>
+              <FileName>drv_usart1_hi3861.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\Drivers\drv_usart1_hi3861.h</FilePath>
             </File>
           </Files>
         </Group>
