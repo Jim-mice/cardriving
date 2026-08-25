@@ -1,5 +1,7 @@
 #include "stm32f10x.h"
-#include "bsp_ws2812.h"
+
+#include "bsp_light.h"
+#include "drv_usart1_hi3861.h"
 
 
 void delay(uint32_t t)
@@ -8,45 +10,55 @@ void delay(uint32_t t)
 }
 
 
-
 int main(void)
 {
 
-    WS2812_FR_Init();
+    Light_Init();
 
-    WS2812_BA_Init();
+    USART1_Hi3861_Init();
+
+
+    USART1_SendString(
+        "STM32 READY\r\n"
+    );
 
 
     while(1)
     {
 
+        /*
+            ?????
+        */
+        Light_Run();
 
-        int i;
 
-
-        for(i=0;i<6;i++)
+        /*
+            ??????
+        */
+        if(USART1_RX_Flag)
         {
 
-            WS2812_FR_Show(
-                i,
-                255,
-                0,
-                0
+            USART1_RX_Flag=0;
+
+
+            USART1_SendString(
+                "RECV:"
             );
 
 
-            WS2812_BA_Show(
-                5-i,
-                0,
-                0,
-                255
+            USART1_SendString(
+                (char*)USART1_RX_Buffer
             );
 
 
-            delay(3000000);
+            USART1_SendString(
+                "\r\n"
+            );
 
         }
 
+
+        delay(3000000);
 
     }
 
