@@ -1,0 +1,29 @@
+static_library("qst_car") {
+
+    sources = [
+        "qst_car_main.c",
+
+        "src/Peripheral.c",
+        "src/robot_hcsr04.c",
+        "src/robot_l9110s.c",
+        "src/robot_sg90.c",
+        "src/trace_model.c",
+        "src/uart_task9.c",
+    ]
+
+    include_dirs = [
+        "include",
+
+        "//utils/native/lite/include",
+
+        # CMSIS RTOS2
+        "//kernel/liteos_m/components/cmsis/2.0",
+
+        # WifiIot APIs, including UartRead/UartWrite declarations
+        "//base/iot_hardware/interfaces/kits/wifiiot_lite",
+
+        # MQTT
+        "//third_party/paho_mqtt/MQTTClient/src",
+        "//third_party/paho_mqtt/MQTTPacket/src",
+    ]
+}
