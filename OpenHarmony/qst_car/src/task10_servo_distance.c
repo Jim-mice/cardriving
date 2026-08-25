@@ -11,20 +11,24 @@ extern float GetDistance(void);
 #define SERVO_SETTLE_DELAY_MS 500
 #define SERVO_SCAN_DELAY_MS   1000
 
-static void PrintDistance(const char *position)
+static void PrintDistance(const char *angle)
 {
     float distance = GetDistance();
 
+    printf("angle: %s\r\n", angle);
     if (distance < 0.0f) {
-        printf("%s distance: no echo\r\n", position);
+        printf("distance: no echo\r\n");
         return;
     }
-    printf("%s distance: %.2f cm\r\n", position, (double)distance);
+    printf("distance: %.2f cm\r\n", (double)distance);
 }
 
 static void ServoDistanceTask(void *argument)
 {
     (void)argument;
+
+    regress_middle();
+    osDelay(SERVO_SETTLE_DELAY_MS);
 
     while (1) {
         engine_turn_left();
