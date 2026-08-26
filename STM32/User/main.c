@@ -2,6 +2,7 @@
 
 #include "bsp_light.h"
 #include "bsp_gpio.h"
+#include "bsp_motor_l9110.h"
 #include "drv_usart1_hi3861.h"
 
 
@@ -38,6 +39,7 @@ int main(void)
     Light_Init();
 
     USART1_Hi3861_Init();
+    motor_init();
 
 
     USART1_SendString(
@@ -52,6 +54,16 @@ int main(void)
             ?????
         */
         Light_Run();
+        motor_left_set(500);
+        delay(200000);
+        motor_left_set(0);
+        delay(200000);
+
+        motor_right_set(500);
+        delay(200000);
+        motor_right_set(0);
+
+        delay(1000000);
 
 
         /*

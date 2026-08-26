@@ -337,7 +337,7 @@
               <MiscControls></MiscControls>
               <Define>STM32F10X_MD,USE_STDPERIPH_DRIVER,HSE_VALUE=8000000</Define>
               <Undefine></Undefine>
-              <IncludePath>.\Core;.\Config;.\Libraries\CMSIS\Core\Include;.\Libraries\STM32F10x_Device\Include;.\Libraries\STM32F10x_StdPeriph_Driver\inc;.\BSP;.\Drivers</IncludePath>
+              <IncludePath>.\Core;.\Config;.\Libraries\CMSIS\Core\Include;.\Libraries\STM32F10x_Device\Include;.\Libraries\STM32F10x_StdPeriph_Driver\inc;.\BSP;.\Drivers;C:\Keil_v5\ARM\PACK\Keil\STM32F1xx_DFP\1.0.5\Device\StdPeriph_Driver\inc</IncludePath>
             </VariousControls>
           </Cads>
           <Aads>
@@ -426,6 +426,11 @@
               <FileType>1</FileType>
               <FilePath>.\Libraries\STM32F10x_StdPeriph_Driver\src\stm32f10x_usart.c</FilePath>
             </File>
+            <File>
+              <FileName>stm32f10x_tim.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>C:\Keil_v5\ARM\PACK\Keil\STM32F1xx_DFP\1.0.5\Device\StdPeriph_Driver\src\stm32f10x_tim.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
@@ -460,6 +465,26 @@
               <FileName>bsp_light.h</FileName>
               <FileType>5</FileType>
               <FilePath>.\BSP\bsp_light.h</FilePath>
+            </File>
+            <File>
+              <FileName>bsp_motor_pwm.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\BSP\bsp_motor_pwm.c</FilePath>
+            </File>
+            <File>
+              <FileName>bsp_motor_pwm.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\BSP\bsp_motor_pwm.h</FilePath>
+            </File>
+            <File>
+              <FileName>bsp_motor_l9110.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\BSP\bsp_motor_l9110.c</FilePath>
+            </File>
+            <File>
+              <FileName>bsp_motor_l9110.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\BSP\bsp_motor_l9110.h</FilePath>
             </File>
           </Files>
         </Group>
