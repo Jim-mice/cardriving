@@ -355,7 +355,7 @@
               <MiscControls></MiscControls>
               <Define>STM32F10X_MD,USE_STDPERIPH_DRIVER,HSE_VALUE=8000000</Define>
               <Undefine></Undefine>
-              <IncludePath>.\Core;.\Config;.\Libraries\CMSIS\Core\Include;.\Libraries\STM32F10x_Device\Include;.\Libraries\STM32F10x_StdPeriph_Driver\inc</IncludePath>
+              <IncludePath>.\Core;.\Config;.\Libraries\CMSIS\Core\Include;.\Libraries\STM32F10x_Device\Include;.\Libraries\STM32F10x_StdPeriph_Driver\inc;.\BSP;.\Drivers;C:\Keil_v5\ARM\PACK\Keil\STM32F1xx_DFP\1.0.5\Device\StdPeriph_Driver\inc</IncludePath>
             </VariousControls>
           </Aads>
           <LDads>
@@ -486,6 +486,16 @@
               <FileType>5</FileType>
               <FilePath>.\BSP\bsp_motor_l9110.h</FilePath>
             </File>
+            <File>
+              <FileName>bsp_pn532.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\BSP\bsp_pn532.c</FilePath>
+            </File>
+            <File>
+              <FileName>bsp_pn532.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\BSP\bsp_pn532.h</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
@@ -500,6 +510,16 @@
               <FileName>drv_usart1_hi3861.h</FileName>
               <FileType>5</FileType>
               <FilePath>.\Drivers\drv_usart1_hi3861.h</FilePath>
+            </File>
+            <File>
+              <FileName>drv_usart2_nfc.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\Drivers\drv_usart2_nfc.c</FilePath>
+            </File>
+            <File>
+              <FileName>drv_usart2_nfc.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\Drivers\drv_usart2_nfc.h</FilePath>
             </File>
           </Files>
         </Group>
