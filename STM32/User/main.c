@@ -2,6 +2,7 @@
 
 #include "bsp_light.h"
 #include "bsp_gpio.h"
+#include "bsp_encoder.h"
 #include "bsp_motor_l9110.h"
 #include "drv_usart1_hi3861.h"
 #include "drv_usart2_nfc.h"
@@ -357,6 +358,7 @@ int main(void)
     USART1_Hi3861_Init();
     motor_init();
     motor_stop();
+    encoder_init();
 
     SystemCoreClockUpdate();
     if (SysTick_Config(SystemCoreClock / 1000U) != 0U) {
@@ -414,7 +416,6 @@ int main(void)
     } else {
         USART1_SendString("PN532 firmware failed\r\n");
     }
-
 
     while(1)
     {
