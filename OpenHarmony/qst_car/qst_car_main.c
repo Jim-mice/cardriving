@@ -20,11 +20,12 @@ static void QstCarTask(void)
     Peripheral_Init();
     TaskWifiInit();
 
-    /*
-     * WiFiConnectTask has below-normal priority.  Yield here so its
-     * EnableWifi() attempt runs before creating the remaining app tasks.
-     */
-    osDelay(WIFI_STA_START_WAIT_MS);
+    /* Only wait for hi_wifi_sta_start(), never for scan, connect or DHCP. */
+    if (TaskWifiWaitStaStarted(WIFI_STA_START_WAIT_MS) == 1) {
+        printf("wifi sta started\r\n");
+    } else {
+        printf("wifi sta start wait timeout or failed\r\n");
+    }
 
     TaskHelloInit();
 

@@ -13,13 +13,17 @@
 #include "wifi_device.h"
 #include "wifiiot_errno.h"
 #include "ohos_init.h"
+#include "wifi_connect.h"
 
 #define DEF_TIMEOUT 15
 #define ONE_SECOND 1
 #define WIFI_SCAN_RETRY_MAX 3
 #define WIFI_SCAN_RETRY_DELAY_MS 2000
+#define DHCP_TIMEOUT_MS 20000
+#define DHCP_POLL_INTERVAL_MS 1000
 
-#define SELECT_WIFI_SECURITYTYPE WIFI_SEC_TYPE_PSK  
+#define SELECT_WIFI_SECURITYTYPE WIFI_SEC_TYPE_PSK
+#define SELECT_WLAN_PORT "wlan0"
 
 static void WiFiInit(void);
 static void WaitSacnResult(void);
@@ -33,16 +37,20 @@ static void OnHotspotStaLeaveHandler(StationInfo *info);
 static int g_staScanSuccess = 0;
 static int g_ConnectSuccess = 0;
 static int ssid_count = 0;
+static WifiStaStartCallback g_staStartCallback;
 WifiEvent g_wifiEventHandler = {0};
 WifiErrorCode error;
 
-#define SELECT_WLAN_PORT "wlan0"
+void WifiConnectSetStaStartCallback(WifiStaStartCallback callback)
+{
+    g_staStartCallback = callback;
+}
 
 int WifiConnect(const char *ssid, const char *psk)
 {
     WifiScanInfo *info = NULL;
     unsigned int size = WIFI_SCAN_HOTSPOT_LIMIT;
-    static struct netif *g_lwip_netif = NULL;
+    struct netif *lwipNetif = NULL;
     WifiErrorCode enableRet;
     unsigned int retryCount = 0;
     int selectedIndex = -1;
@@ -50,51 +58,44 @@ int WifiConnect(const char *ssid, const char *psk)
     osDelay(200);
     printf("<--System Init-->\r\n");
 
-    //初始化WIFI
     WiFiInit();
 
-    //使能WIFI
     enableRet = EnableWifi();
-    if (enableRet != WIFI_SUCCESS)
-    {
+    if (enableRet != WIFI_SUCCESS) {
         printf("EnableWifi failed, ret=%d\r\n", enableRet);
+        if (g_staStartCallback != NULL) {
+            g_staStartCallback((int)enableRet);
+        }
         return -1;
     }
+    if (g_staStartCallback != NULL) {
+        g_staStartCallback(WIFI_SUCCESS);
+    }
 
-    //判断WIFI是否激活
-    if (IsWifiActive() == 0)
-    {
+    if (IsWifiActive() == 0) {
         printf("Wifi station is not actived.\r\n");
         return -1;
     }
 
-    //分配空间，保存WiFi信息
     info = malloc(sizeof(WifiScanInfo) * WIFI_SCAN_HOTSPOT_LIMIT);
-    if (info == NULL)
-    {
+    if (info == NULL) {
         return -1;
     }
-    // Scan until the requested SSID is found, with at most three retries.
+
     while (selectedIndex < 0) {
-        //重置标志位
         ssid_count = 0;
         g_staScanSuccess = 0;
         size = WIFI_SCAN_HOTSPOT_LIMIT;
-
-        //开始扫描
         Scan();
-
-        //等待扫描结果
         WaitSacnResult();
 
         if (g_staScanSuccess == 1) {
-            //获取扫描列表
             error = GetScanInfoList(info, &size);
             if (error == WIFI_SUCCESS) {
-                //打印WiFi列表
                 printf("********************\r\n");
                 for (uint8_t i = 0; i < ssid_count; i++) {
-                    printf("no:%03d, ssid:%-30s, rssi:%5d\r\n", i + 1, info[i].ssid, info[i].rssi / 100);
+                    printf("no:%03d, ssid:%-30s, rssi:%5d\r\n",
+                        i + 1, info[i].ssid, info[i].rssi / 100);
                     if (strcmp(ssid, info[i].ssid) == 0) {
                         selectedIndex = (int)i;
                     }
@@ -115,53 +116,56 @@ int WifiConnect(const char *ssid, const char *psk)
         printf("WiFi scan retry %u/%u\r\n", retryCount, WIFI_SCAN_RETRY_MAX);
         osDelay(WIFI_SCAN_RETRY_DELAY_MS);
     }
-    
-    //连接指定的WiFi热点
+
     {
         int result;
+        WifiDeviceConfig selectApConfig = {0};
 
         printf("Select:%3d wireless, Waiting...\r\n", selectedIndex + 1);
+        strcpy(selectApConfig.ssid, info[selectedIndex].ssid);
+        strcpy(selectApConfig.preSharedKey, psk);
+        selectApConfig.securityType = SELECT_WIFI_SECURITYTYPE;
 
-        //拷贝要连接的热点信息
-        WifiDeviceConfig select_ap_config = {0};
-        strcpy(select_ap_config.ssid, info[selectedIndex].ssid);
-        strcpy(select_ap_config.preSharedKey, psk);
-        select_ap_config.securityType = SELECT_WIFI_SECURITYTYPE;
+        if (AddDeviceConfig(&selectApConfig, &result) != WIFI_SUCCESS) {
+            free(info);
+            return -1;
+        }
+        if (ConnectTo(result) != WIFI_SUCCESS || WaitConnectResult() != 1) {
+            free(info);
+            return -1;
+        }
 
-        if (AddDeviceConfig(&select_ap_config, &result) == WIFI_SUCCESS) {
-            if (ConnectTo(result) == WIFI_SUCCESS && WaitConnectResult() == 1) {
-                printf("WiFi connect succeed!\r\n");
-                g_lwip_netif = netifapi_netif_find(SELECT_WLAN_PORT);
+        printf("WiFi connect succeed!\r\n");
+        lwipNetif = netifapi_netif_find(SELECT_WLAN_PORT);
+    }
+    free(info);
+
+    if (lwipNetif == NULL) {
+        printf("wlan0 unavailable\r\n");
+        return -1;
+    }
+
+    dhcp_start(lwipNetif);
+    printf("begain to dhcp\r\n");
+
+    {
+        unsigned int dhcpElapsed = 0;
+        while (dhcpElapsed < DHCP_TIMEOUT_MS) {
+            if (dhcp_is_bound(lwipNetif) == ERR_OK) {
+                printf("<-- DHCP state:OK -->\r\n");
+                netifapi_netif_common(lwipNetif, dhcp_clients_info_show, NULL);
+                osDelay(100);
+                return 0;
             }
+
+            printf("<-- DHCP state:Inprogress -->\r\n");
+            osDelay(DHCP_POLL_INTERVAL_MS);
+            dhcpElapsed += DHCP_POLL_INTERVAL_MS;
         }
     }
-     //启动DHCP
-    if (g_lwip_netif)
-    {
-        dhcp_start(g_lwip_netif);
-        printf("begain to dhcp\r\n");
-    }
 
-
-    //等待DHCP
-    for(;;)
-    {
-        if(dhcp_is_bound(g_lwip_netif) == ERR_OK)
-        {
-            printf("<-- DHCP state:OK -->\r\n");
-
-            //打印获取到的IP信息
-            netifapi_netif_common(g_lwip_netif, dhcp_clients_info_show, NULL);
-            break;
-        }
-
-        printf("<-- DHCP state:Inprogress -->\r\n");
-        osDelay(100);
-    }
-
-    osDelay(100);
-
-    return 0;
+    printf("dhcp timeout\r\n");
+    return -1;
 }
 
 static void WiFiInit(void)
@@ -173,103 +177,80 @@ static void WiFiInit(void)
     g_wifiEventHandler.OnHotspotStaLeave = OnHotspotStaLeaveHandler;
     g_wifiEventHandler.OnHotspotStateChanged = OnHotspotStateChangedHandler;
     error = RegisterWifiEvent(&g_wifiEventHandler);
-    if (error != WIFI_SUCCESS)
-    {
+    if (error != WIFI_SUCCESS) {
         printf("register wifi event fail!\r\n");
-    }
-    else
-    {
+    } else {
         printf("register wifi event succeed!\r\n");
     }
 }
 
 static void OnWifiScanStateChangedHandler(int state, int size)
 {
-    if (size > 0)
-    {
+    if (size > 0) {
         ssid_count = size;
         g_staScanSuccess = 1;
     }
     printf("callback function for wifi scan:%d, %d\r\n", state, size);
-    return;
 }
 
 static void OnWifiConnectionChangedHandler(int state, WifiLinkedInfo *info)
 {
-    if (info == NULL)
-    {
-        printf("WifiConnectionChanged:info is null, stat is %d.\n", state);
-    }
-    else
-    {
-        if (state == WIFI_STATE_AVALIABLE)
-        {
-            g_ConnectSuccess = 1;
-        }
-        else
-        {
-            g_ConnectSuccess = 0;
-        }
+    if (info == NULL) {
+        printf("WifiConnectionChanged:info is null, stat is %d.\r\n", state);
+    } else if (state == WIFI_STATE_AVALIABLE) {
+        g_ConnectSuccess = 1;
+    } else {
+        g_ConnectSuccess = 0;
     }
 }
 
 static void OnHotspotStaJoinHandler(StationInfo *info)
 {
     (void)info;
-    printf("STA join AP\n");
-    return;
+    printf("STA join AP\r\n");
 }
 
 static void OnHotspotStaLeaveHandler(StationInfo *info)
 {
     (void)info;
-    printf("HotspotStaLeave:info is null.\n");
-    return;
+    printf("HotspotStaLeave:info is null.\r\n");
 }
 
 static void OnHotspotStateChangedHandler(int state)
 {
-    printf("HotspotStateChanged:state is %d.\n", state);
-    return;
+    printf("HotspotStateChanged:state is %d.\r\n", state);
 }
 
 static void WaitSacnResult(void)
 {
     int scanTimeout = DEF_TIMEOUT;
-    while (scanTimeout > 0)
-    {
+    while (scanTimeout > 0) {
         sleep(ONE_SECOND);
         scanTimeout--;
-        if (g_staScanSuccess == 1)
-        {
-            printf("WaitSacnResult:wait success[%d]s\n", (DEF_TIMEOUT - scanTimeout));
+        if (g_staScanSuccess == 1) {
+            printf("WaitSacnResult:wait success[%d]s\r\n", DEF_TIMEOUT - scanTimeout);
             break;
         }
     }
-    if (scanTimeout <= 0)
-    {
-        printf("WaitSacnResult:timeout!\n");
+    if (scanTimeout <= 0) {
+        printf("WaitSacnResult:timeout!\r\n");
     }
 }
 
 static int WaitConnectResult(void)
 {
-    int ConnectTimeout = DEF_TIMEOUT;
-    while (ConnectTimeout > 0)
-    {
+    int connectTimeout = DEF_TIMEOUT;
+    while (connectTimeout > 0) {
         sleep(ONE_SECOND);
-        ConnectTimeout--;
-        if (g_ConnectSuccess == 1)
-        {
-            printf("WaitConnectResult:wait success[%d]s\n", (DEF_TIMEOUT - ConnectTimeout));
+        connectTimeout--;
+        if (g_ConnectSuccess == 1) {
+            printf("WaitConnectResult:wait success[%d]s\r\n", DEF_TIMEOUT - connectTimeout);
             break;
         }
     }
-    if (ConnectTimeout <= 0)
-    {
-        printf("WaitConnectResult:timeout!\n");
+    if (connectTimeout <= 0) {
+        printf("WaitConnectResult:timeout!\r\n");
         return 0;
     }
-
     return 1;
 }

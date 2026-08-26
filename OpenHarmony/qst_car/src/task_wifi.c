@@ -9,9 +9,18 @@
 
 #define WIFI_STA_SSID       "hamster"
 #define WIFI_STA_PASSWORD   "12345678"
-#define WIFI_CONNECT_TIMEOUT_MS 60000
 
-static volatile int g_wifiConnectFinished;
+/* 0: waiting, 1: EnableWifi succeeded, -1: EnableWifi failed. */
+static volatile int g_wifiStaStartState;
+
+static void WifiStaStartNotify(int result)
+{
+    if (result == 0) {
+        g_wifiStaStartState = 1;
+    } else {
+        g_wifiStaStartState = -1;
+    }
+}
 
 static void PrintIpv4Address(const char *name, const ip4_addr_t *address)
 {
@@ -49,7 +58,6 @@ static void WifiConnectTask(void *argument)
 
     printf("wifi connecting...\r\n");
     result = WifiConnect(WIFI_STA_SSID, WIFI_STA_PASSWORD);
-    g_wifiConnectFinished = 1;
 
     if (result == 0) {
         printf("wifi connected\r\n");
@@ -59,22 +67,12 @@ static void WifiConnectTask(void *argument)
     }
 }
 
-static void WifiTimeoutTask(void *argument)
-{
-    (void)argument;
-
-    osDelay(WIFI_CONNECT_TIMEOUT_MS);
-    if (g_wifiConnectFinished == 0) {
-        printf("wifi connect timeout\r\n");
-    }
-}
-
 void TaskWifiInit(void)
 {
     osThreadAttr_t connectAttr;
-    osThreadAttr_t timeoutAttr;
 
-    g_wifiConnectFinished = 0;
+    g_wifiStaStartState = 0;
+    WifiConnectSetStaStartCallback(WifiStaStartNotify);
 
     connectAttr.name = "wifi_connect";
     connectAttr.attr_bits = 0;
@@ -84,19 +82,19 @@ void TaskWifiInit(void)
     connectAttr.stack_size = 4096;
     connectAttr.priority = osPriorityBelowNormal;
 
-    timeoutAttr.name = "wifi_timeout";
-    timeoutAttr.attr_bits = 0;
-    timeoutAttr.cb_mem = NULL;
-    timeoutAttr.cb_size = 0;
-    timeoutAttr.stack_mem = NULL;
-    timeoutAttr.stack_size = 2048;
-    timeoutAttr.priority = osPriorityBelowNormal;
-
     if (osThreadNew(WifiConnectTask, NULL, &connectAttr) == NULL) {
         printf("wifi thread create failed\r\n");
-        return;
     }
-    if (osThreadNew(WifiTimeoutTask, NULL, &timeoutAttr) == NULL) {
-        printf("wifi timeout thread create failed\r\n");
+}
+
+int TaskWifiWaitStaStarted(uint32_t timeoutMs)
+{
+    uint32_t elapsed = 0;
+
+    while (g_wifiStaStartState == 0 && elapsed < timeoutMs) {
+        osDelay(10);
+        elapsed += 10;
     }
+
+    return (int)g_wifiStaStartState;
 }
