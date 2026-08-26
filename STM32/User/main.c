@@ -40,6 +40,12 @@ int main(void)
 
     USART1_Hi3861_Init();
     motor_init();
+    motor_left_set(600);
+    motor_right_set(600);
+
+    /* One-shot, positive-direction dual-wheel PWM demonstration. */
+    delay(50000000);
+    motor_stop();
 
 
     USART1_SendString(
@@ -49,22 +55,7 @@ int main(void)
 
     while(1)
     {
-
-        /*
-            ?????
-        */
         Light_Run();
-        motor_left_set(500);
-        delay(200000);
-        motor_left_set(0);
-        delay(200000);
-
-        motor_right_set(500);
-        delay(200000);
-        motor_right_set(0);
-
-        delay(1000000);
-
 
         /*
             ??????
@@ -86,10 +77,6 @@ int main(void)
             }
 
         }
-
-
-        delay(3000000);
-
     }
 
 }
