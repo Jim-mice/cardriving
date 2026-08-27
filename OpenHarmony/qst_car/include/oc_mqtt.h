@@ -3,12 +3,10 @@
 #define LITEOS_LAB_IOT_LINK_OC_OC_MQTT_OC_MQTT_PROFILE_OC_MQTT_PROFILE_H_
 
 #include <stdint.h>
+#include "cloud_config.h"
 
-
-#define OC_SERVER_URL              "tcp://183.230.40.39:6002"
-//#define OC_SERVER_IP                "121.36.42.100"
-#define OC_SERVER_IP                "01bf5d8f97.iot-mqtts.cn-north-4.myhuaweicloud.com"
-#define OC_SERVER_PORT              1883
+#define OC_SERVER_IP                CLOUD_MQTT_SERVER
+#define OC_SERVER_PORT              CLOUD_MQTT_PORT
 #define OC_CLIENT_ID_LEN          128
 #define OC_USERNAME_LEN         128
 #define OC_PASSWORD_LEN          128
@@ -134,7 +132,7 @@ typedef struct bp_oc_info *bp_oc_info_t;
 
 int oc_mqtt_init(void);
 
-void device_info_init(char *client_id, char * username, char *password);
+int device_info_init(const char *client_id, const char *username, const char *password);
 
 void oc_set_cmd_rsp_cb(void (*cmd_rsp_cb)(uint8_t *recv_data, uint32_t recv_size, uint8_t **resp_data, uint32_t *resp_size));
 

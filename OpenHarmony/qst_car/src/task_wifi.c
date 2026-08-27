@@ -12,6 +12,7 @@
 
 /* 0: waiting, 1: EnableWifi succeeded, -1: EnableWifi failed. */
 static volatile int g_wifiStaStartState;
+static volatile int g_wifiNetworkReady;
 
 static void WifiStaStartNotify(int result)
 {
@@ -60,9 +61,11 @@ static void WifiConnectTask(void *argument)
     result = WifiConnect(WIFI_STA_SSID, WIFI_STA_PASSWORD);
 
     if (result == 0) {
+        g_wifiNetworkReady = 1;
         printf("wifi connected\r\n");
         PrintWifiIp();
     } else {
+        g_wifiNetworkReady = 0;
         printf("wifi connect failed\r\n");
     }
 }
@@ -72,6 +75,7 @@ void TaskWifiInit(void)
     osThreadAttr_t connectAttr;
 
     g_wifiStaStartState = 0;
+    g_wifiNetworkReady = 0;
     WifiConnectSetStaStartCallback(WifiStaStartNotify);
 
     connectAttr.name = "wifi_connect";
@@ -97,4 +101,9 @@ int TaskWifiWaitStaStarted(uint32_t timeoutMs)
     }
 
     return (int)g_wifiStaStartState;
+}
+
+int TaskWifiIsNetworkReady(void)
+{
+    return (int)g_wifiNetworkReady;
 }

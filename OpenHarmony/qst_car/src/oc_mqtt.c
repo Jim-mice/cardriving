@@ -1,6 +1,7 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include "MQTTClient.h"
 #include <unistd.h>
 #include "cJSON.h"
@@ -15,7 +16,7 @@ typedef struct
 }oc_mqtt_profile_cb_t;
 
 static oc_mqtt_profile_cb_t s_oc_mqtt_profile_cb;
-static char init_ok = FALSE;
+static int init_ok;
 static MQTTClient mq_client;
 struct bp_oc_info oc_info;
 struct oc_device
@@ -63,51 +64,95 @@ int buf_size;
 Network n;
 MQTTPacket_connectData data = MQTTPacket_connectData_initializer;  
 
-static int oc_mqtt_entry(void)
+static void OCMqttReleaseResources(void)
 {
-    int rc = 0;
-    
-	NetworkInit(&n);
-	NetworkConnect(&n, OC_SERVER_IP, OC_SERVER_PORT);
-
-    buf_size  = 2048;
-    oc_mqtt_buf = (unsigned char *) malloc(buf_size);
-    oc_mqtt_readbuf = (unsigned char *) malloc(buf_size);
-    if (!(oc_mqtt_buf && oc_mqtt_readbuf))
-    {
-        printf("No memory for MQTT client buffer!");
-        return -2;
+    if (oc_mqtt_buf != NULL) {
+        free(oc_mqtt_buf);
+        oc_mqtt_buf = NULL;
     }
-
-	MQTTClientInit(&mq_client, &n, 1000, oc_mqtt_buf, buf_size, oc_mqtt_readbuf, buf_size);
-	
-    MQTTStartTask(&mq_client);
-
-
-    data.keepAliveInterval = 30;
-    data.cleansession = 1;
-	data.clientID.cstring = oc_info.client_id;
-	data.username.cstring = oc_info.username;
-	data.password.cstring = oc_info.password;
-	data.MQTTVersion =3;
-
-	
-    mq_client.defaultMessageHandler = mqtt_callback;
-
-	rc = MQTTConnect(&mq_client, &data);
-
-    return rc;
-    
+    if (oc_mqtt_readbuf != NULL) {
+        free(oc_mqtt_readbuf);
+        oc_mqtt_readbuf = NULL;
+    }
 }
 
-
-void device_info_init(char *client_id, char * username, char *password)
+static int OCMqttCopyString(char *destination, size_t destinationSize,
+    const char *source)
 {
-    oc_info.user_device_id_flg = 1;
-    strncpy(oc_info.client_id,client_id, strlen(client_id));
-    strncpy(oc_info.username,username, strlen(username));
-    strncpy(oc_info.password,password, strlen(password));
+    size_t length;
 
+    if (destination == NULL || source == NULL) {
+        return -1;
+    }
+    length = strlen(source);
+    if (length >= destinationSize) {
+        return -1;
+    }
+    memcpy(destination, source, length + 1U);
+    return 0;
+}
+
+static int oc_mqtt_entry(void)
+{
+    int rc;
+
+    NetworkInit(&n);
+    rc = NetworkConnect(&n, OC_SERVER_IP, OC_SERVER_PORT);
+    printf("cloud mqtt NetworkConnect ret=%d\r\n", rc);
+    if (rc != 0) {
+        return (int)en_oc_mqtt_err_network;
+    }
+
+    buf_size = 2048;
+    oc_mqtt_buf = (unsigned char *)malloc((size_t)buf_size);
+    oc_mqtt_readbuf = (unsigned char *)malloc((size_t)buf_size);
+    if (oc_mqtt_buf == NULL || oc_mqtt_readbuf == NULL) {
+        printf("cloud mqtt buffer allocation failed\r\n");
+        OCMqttReleaseResources();
+        NetworkDisconnect(&n);
+        return (int)en_oc_mqtt_err_sysmem;
+    }
+
+    MQTTClientInit(&mq_client, &n, 1000U, oc_mqtt_buf, (size_t)buf_size,
+        oc_mqtt_readbuf, (size_t)buf_size);
+    data.keepAliveInterval = 30;
+    data.cleansession = 1;
+    data.clientID.cstring = oc_info.client_id;
+    data.username.cstring = oc_info.username;
+    data.password.cstring = oc_info.password;
+    data.MQTTVersion = 3;
+    mq_client.defaultMessageHandler = mqtt_callback;
+
+    rc = MQTTConnect(&mq_client, &data);
+    printf("cloud mqtt MQTTConnect ret=%d\r\n", rc);
+    if (rc != 0) {
+        OCMqttReleaseResources();
+        NetworkDisconnect(&n);
+        return rc;
+    }
+
+    rc = MQTTStartTask(&mq_client);
+    if (rc == 0) {
+        printf("cloud mqtt MQTTStartTask failed\r\n");
+        MQTTDisconnect(&mq_client);
+        OCMqttReleaseResources();
+        NetworkDisconnect(&n);
+        return (int)en_oc_mqtt_err_system;
+    }
+    return 0;
+}
+
+int device_info_init(const char *client_id, const char *username,
+    const char *password)
+{
+    if (OCMqttCopyString(oc_info.client_id, sizeof(oc_info.client_id), client_id) != 0 ||
+        OCMqttCopyString(oc_info.username, sizeof(oc_info.username), username) != 0 ||
+        OCMqttCopyString(oc_info.password, sizeof(oc_info.password), password) != 0) {
+        return -1;
+    }
+
+    oc_info.user_device_id_flg = 1;
+    return 0;
 }
 
 /**
@@ -121,29 +166,20 @@ void device_info_init(char *client_id, char * username, char *password)
  */
 int oc_mqtt_init(void)
 {
-    int result = 0;
+    int result;
 
-    if (init_ok)
-    {
-        //LOG_D("oc mqtt already init!");
+    if (init_ok != 0) {
         return 0;
     }
-    if (oc_mqtt_entry() < 0)
-    {
-        result = -2;
-        goto __exit;
+
+    result = oc_mqtt_entry();
+    if (result != 0) {
+        printf("cloud mqtt init failed: %d\r\n", result);
+        return result;
     }
-    __exit:
-    if (!result)
-    {
-        //LOG_I("oc package(V%s) initialize success.", oc_SW_VERSION);
-        init_ok = 0;
-    }
-    else
-    {
-        //LOG_E("oc package(V%s) initialize failed(%d).", oc_SW_VERSION, result);
-    }
-    return result;
+
+    init_ok = 1;
+    return 0;
 }
 /**
  * set the command responses call back function
@@ -171,46 +207,57 @@ void oc_set_cmd_rsp_cb(void (*cmd_rsp_cb)(uint8_t *recv_data, uint32_t recv_size
  * @return  0 : publish success
  *         -1 : publish fail
  */
- int oc_mqtt_publish(char  *topic,uint8_t *msg,int msg_len,int qos)
+int oc_mqtt_publish(char *topic, uint8_t *msg, int msg_len, int qos)
 {
     MQTTMessage message;
+    int rc;
 
-    LOS_ASSERT(topic);
-    LOS_ASSERT(msg);
-
-    message.qos = qos;
-    message.retained = 0;
-    message.payload = (void *) msg;
-    message.payloadlen = msg_len;
-
-    if (MQTTPublish(&mq_client, topic, &message) < 0)
-    {
-        return -1;
+    if (topic == NULL || msg == NULL || msg_len < 0) {
+        return (int)en_oc_mqtt_err_parafmt;
+    }
+    if (init_ok == 0 || MQTTIsConnected(&mq_client) == 0) {
+        return (int)en_oc_mqtt_err_noconected;
     }
 
-    return 0;
+    message.qos = (enum QoS)qos;
+    message.retained = 0;
+    message.payload = (void *)msg;
+    message.payloadlen = (size_t)msg_len;
+
+    rc = MQTTPublish(&mq_client, topic, &message);
+    printf("cloud mqtt publish ret=%d\r\n", rc);
+    return (rc == 0) ? (int)en_oc_mqtt_err_ok : (int)en_oc_mqtt_err_publish;
 }
 ///< use this function to make a topic to publish
 ///< if request_id  is needed depends on the fmt
-static char *topic_make(char *fmt, char *device_id, char *request_id)
+static char *topic_make(const char *fmt, const char *device_id,
+    const char *request_id)
 {
-    int len;
-    char *ret = NULL;
+    int length;
+    char *ret;
 
-    if(NULL == device_id)
-    {
-        return ret;
-    }
-    len = strlen(fmt) + strlen(device_id);
-    if(NULL != request_id)
-    {
-        len += strlen(request_id);
+    if (fmt == NULL || device_id == NULL) {
+        return NULL;
     }
 
-    ret = malloc(len);
-    if(NULL != ret)
-    {
-        (void) snprintf(ret,len,fmt,device_id,request_id);
+    if (request_id == NULL) {
+        length = snprintf(NULL, 0U, fmt, device_id);
+    } else {
+        length = snprintf(NULL, 0U, fmt, device_id, request_id);
+    }
+    if (length < 0) {
+        return NULL;
+    }
+
+    ret = (char *)malloc((size_t)length + 1U);
+    if (ret == NULL) {
+        return NULL;
+    }
+
+    if (request_id == NULL) {
+        (void)snprintf(ret, (size_t)length + 1U, fmt, device_id);
+    } else {
+        (void)snprintf(ret, (size_t)length + 1U, fmt, device_id, request_id);
     }
     return ret;
 }
@@ -289,7 +336,6 @@ int oc_mqtt_profile_propertyreport(char *deviceid,oc_mqtt_profile_service_t *pay
     if((NULL != topic) && (NULL != msg))
     {
         ret = oc_mqtt_publish(topic,(uint8_t *)msg,strlen(msg),(int)en_mqtt_al_qos_1);
-            printf("上报数据成功！！！");
     }
     else
     {

@@ -24,6 +24,8 @@ static volatile uint16_t g_ir;
 static volatile uint16_t g_proximity;
 static volatile int g_sht20DataValid;
 static volatile int g_ap3216DataValid;
+static volatile int g_sht20SampleReady;
+static volatile int g_ap3216SampleReady;
 static int g_sensorTaskStarted;
 
 static void OledShowStatus(WifiIotGpioValue left, WifiIotGpioValue right)
@@ -81,6 +83,7 @@ static void SensorTask(void *argument)
         }
         if ((elapsed % SENSOR_READ_PERIOD_MS) == 0U) {
             if (g_sht20DataValid != 0 && SHT20_ReadData((float *)&g_temperature, (float *)&g_humidity) == 0) {
+                g_sht20SampleReady = 1;
                 if ((elapsed % SENSOR_LOG_PERIOD_MS) == 0U) {
                     printf("temperature: %.2f C\r\n", (double)g_temperature);
                     printf("humidity: %.2f %%\r\n", (double)g_humidity);
@@ -90,6 +93,7 @@ static void SensorTask(void *argument)
             }
             if (g_ap3216DataValid != 0 && AP3216C_ReadData((uint16_t *)&g_ir, (uint16_t *)&g_light,
                 (uint16_t *)&g_proximity) == 0) {
+                g_ap3216SampleReady = 1;
                 if ((elapsed % SENSOR_LOG_PERIOD_MS) == 0U) {
                     printf("light: %u\r\n", (unsigned int)g_light);
                     printf("ir: %u\r\n", (unsigned int)g_ir);
@@ -129,7 +133,8 @@ void TaskSensorInit(void)
 
 int TaskSensorGetSht20Latest(float *temperature, float *humidity)
 {
-    if (temperature == NULL || humidity == NULL || g_sht20DataValid == 0) {
+    if (temperature == NULL || humidity == NULL || g_sht20DataValid == 0 ||
+        g_sht20SampleReady == 0) {
         return 0;
     }
     *temperature = g_temperature;
@@ -139,7 +144,8 @@ int TaskSensorGetSht20Latest(float *temperature, float *humidity)
 
 int TaskSensorGetAp3216Latest(uint16_t *light, uint16_t *ir, uint16_t *proximity)
 {
-    if (light == NULL || ir == NULL || proximity == NULL || g_ap3216DataValid == 0) {
+    if (light == NULL || ir == NULL || proximity == NULL || g_ap3216DataValid == 0 ||
+        g_ap3216SampleReady == 0) {
         return 0;
     }
     *light = g_light;

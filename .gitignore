@@ -22,3 +22,6 @@ Listings/
 # Windows
 Thumbs.db
 Desktop.ini
+
+# Local IoTDA credentials
+OpenHarmony/qst_car/include/cloud_config_private.h

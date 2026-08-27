@@ -5,5 +5,6 @@
 
 void TaskWifiInit(void);
 int TaskWifiWaitStaStarted(uint32_t timeoutMs);
+int TaskWifiIsNetworkReady(void);
 
 #endif
