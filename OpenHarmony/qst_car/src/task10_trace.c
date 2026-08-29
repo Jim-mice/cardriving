@@ -1,6 +1,7 @@
 #include <stdio.h>
 
 #include "cmsis_os2.h"
+#include "app_time.h"
 #include "task10_bluetooth.h"
 #include "task10_trace.h"
 
@@ -17,7 +18,7 @@ static void TraceTask(void *argument)
 
     for (elapsed = 0; elapsed < TRACE_DURATION_MS; elapsed += TRACE_PERIOD_MS) {
         trace_module_once();
-        osDelay(TRACE_PERIOD_MS);
+        osDelay(AppMsToTicks(TRACE_PERIOD_MS));
     }
 
     car_stop();

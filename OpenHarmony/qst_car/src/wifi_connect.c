@@ -9,6 +9,7 @@
 #include "lwip/api_shell.h"
 
 #include "cmsis_os2.h"
+#include "app_time.h"
 #include "hos_types.h"
 #include "wifi_device.h"
 #include "wifiiot_errno.h"
@@ -55,7 +56,7 @@ int WifiConnect(const char *ssid, const char *psk)
     unsigned int retryCount = 0;
     int selectedIndex = -1;
 
-    osDelay(200);
+    osDelay(AppMsToTicks(200U));
     printf("<--System Init-->\r\n");
 
     WiFiInit();
@@ -114,7 +115,7 @@ int WifiConnect(const char *ssid, const char *psk)
         }
         retryCount++;
         printf("WiFi scan retry %u/%u\r\n", retryCount, WIFI_SCAN_RETRY_MAX);
-        osDelay(WIFI_SCAN_RETRY_DELAY_MS);
+        osDelay(AppMsToTicks(WIFI_SCAN_RETRY_DELAY_MS));
     }
 
     {
@@ -154,12 +155,12 @@ int WifiConnect(const char *ssid, const char *psk)
             if (dhcp_is_bound(lwipNetif) == ERR_OK) {
                 printf("<-- DHCP state:OK -->\r\n");
                 netifapi_netif_common(lwipNetif, dhcp_clients_info_show, NULL);
-                osDelay(100);
+                osDelay(AppMsToTicks(100U));
                 return 0;
             }
 
             printf("<-- DHCP state:Inprogress -->\r\n");
-            osDelay(DHCP_POLL_INTERVAL_MS);
+            osDelay(AppMsToTicks(DHCP_POLL_INTERVAL_MS));
             dhcpElapsed += DHCP_POLL_INTERVAL_MS;
         }
     }

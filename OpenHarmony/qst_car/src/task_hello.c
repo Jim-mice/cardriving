@@ -1,6 +1,7 @@
 #include <stdio.h>
 
 #include "cmsis_os2.h"
+#include "app_time.h"
 #include "task_hello.h"
 
 #define HELLO_PERIOD_MS 2000
@@ -11,7 +12,7 @@ static void HelloTask(void *argument)
 
     while (1) {
         printf("Hello OpenHarmony\r\n");
-        osDelay(HELLO_PERIOD_MS);
+        osDelay(AppMsToTicks(HELLO_PERIOD_MS));
     }
 }
 

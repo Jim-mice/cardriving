@@ -2,6 +2,7 @@
 #include <stdio.h>
 
 #include "cmsis_os2.h"
+#include "app_time.h"
 #include "cloud_config.h"
 #include "oc_mqtt.h"
 #include "task_cloud.h"
@@ -90,7 +91,7 @@ static void CloudTask(void *argument)
             printf("cloud waiting network\r\n");
             waitLogElapsed = 0U;
         }
-        osDelay(1000U);
+        osDelay(AppMsToTicks(1000U));
         waitLogElapsed += 1000U;
     }
 
@@ -106,7 +107,7 @@ static void CloudTask(void *argument)
             (unsigned int)CLOUD_MQTT_PORT);
         if (device_info_init(CLOUD_CLIENT_ID, CLOUD_USERNAME, CLOUD_PASSWORD) != 0) {
             printf("cloud mqtt connect failed: invalid credentials\r\n");
-            osDelay(CLOUD_CONNECT_RETRY_MS);
+            osDelay(AppMsToTicks(CLOUD_CONNECT_RETRY_MS));
             continue;
         }
 
@@ -117,12 +118,12 @@ static void CloudTask(void *argument)
         }
 
         printf("cloud mqtt connect failed: %d\r\n", ret);
-        osDelay(CLOUD_CONNECT_RETRY_MS);
+        osDelay(AppMsToTicks(CLOUD_CONNECT_RETRY_MS));
     }
 
     for (;;) {
         (void)CloudReportLatestSensors();
-        osDelay(CLOUD_REPORT_PERIOD_MS);
+        osDelay(AppMsToTicks(CLOUD_REPORT_PERIOD_MS));
     }
 }
 

@@ -19,6 +19,9 @@ static_library("qst_car") {
         "src/task_sht20.c",
         "src/task_ap3216.c",
         "src/task_sensor.c",
+        "src/line_sensor.c",
+        "src/task_car_control.c",
+        "src/udp_telemetry.c",
         "src/task_cloud.c",
         "src/oc_mqtt.c",
         "src/oc_mqtt_profile_package.c",
@@ -27,6 +30,12 @@ static_library("qst_car") {
         "src/hal_bsp_ap3216c.c",
         "src/trace_model.c",
         "src/uart_task9.c",
+        "src/task_encoder_cal.c",
+        "src/task_encoder_arc_roundtrip.c",
+        "src/task_encoder_right_arc_roundtrip.c",
+        "src/task_encoder_two_arc_roundtrip.c",
+        "src/task_encoder_segment_b_progress.c",
+        "src/task_encoder_bpath_follow.c",
     ]
 
     include_dirs = [

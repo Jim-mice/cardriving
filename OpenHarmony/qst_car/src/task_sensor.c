@@ -2,20 +2,19 @@
 #include <stdio.h>
 
 #include "cmsis_os2.h"
+#include "app_time.h"
 #include "hal_bsp_ap3216c.h"
 #include "hal_bsp_sht20.h"
 #include "hal_bsp_ssd1306.h"
 #include "task_hcsr04.h"
 #include "task_sensor.h"
-#include "wifiiot_gpio.h"
+#include "line_sensor.h"
 
 #define SENSOR_POLL_PERIOD_MS 100
 #define SENSOR_IR_PERIOD_MS 200
 #define SENSOR_READ_PERIOD_MS 1000
 #define SENSOR_LOG_PERIOD_MS 5000
 #define SENSOR_OLED_PERIOD_MS 500
-#define SENSOR_IR_LEFT_GPIO WIFI_IOT_GPIO_IDX_13
-#define SENSOR_IR_RIGHT_GPIO WIFI_IOT_GPIO_IDX_14
 
 static volatile float g_temperature;
 static volatile float g_humidity;
@@ -73,13 +72,8 @@ static void SensorTask(void *argument)
     }
 
     for (;;) {
-        if ((elapsed % SENSOR_IR_PERIOD_MS) == 0U &&
-            GpioGetInputVal(SENSOR_IR_LEFT_GPIO, &left) == 0 &&
-            GpioGetInputVal(SENSOR_IR_RIGHT_GPIO, &right) == 0) {
-            if ((elapsed % SENSOR_LOG_PERIOD_MS) == 0U) {
-                printf("IR left: %d\r\n", (int)left);
-                printf("IR right: %d\r\n", (int)right);
-            }
+        if ((elapsed % SENSOR_IR_PERIOD_MS) == 0U) {
+            (void)LineSensorRead(&left, &right);
         }
         if ((elapsed % SENSOR_READ_PERIOD_MS) == 0U) {
             if (g_sht20DataValid != 0 && SHT20_ReadData((float *)&g_temperature, (float *)&g_humidity) == 0) {
@@ -106,7 +100,7 @@ static void SensorTask(void *argument)
         if ((elapsed % SENSOR_OLED_PERIOD_MS) == 0U) {
             OledShowStatus(left, right);
         }
-        osDelay(SENSOR_POLL_PERIOD_MS);
+        osDelay(AppMsToTicks(SENSOR_POLL_PERIOD_MS));
         elapsed += SENSOR_POLL_PERIOD_MS;
     }
 }

@@ -1,6 +1,7 @@
 #include <stdio.h>
 
 #include "cmsis_os2.h"
+#include "app_time.h"
 #include "lwip/ip4_addr.h"
 #include "lwip/netif.h"
 #include "lwip/netifapi.h"
@@ -96,7 +97,7 @@ int TaskWifiWaitStaStarted(uint32_t timeoutMs)
     uint32_t elapsed = 0;
 
     while (g_wifiStaStartState == 0 && elapsed < timeoutMs) {
-        osDelay(10);
+        osDelay(AppMsToTicks(10U));
         elapsed += 10;
     }
 

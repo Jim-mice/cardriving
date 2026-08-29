@@ -2,16 +2,20 @@
 #include <stdint.h>
 #include "ohos_init.h"
 #include "cmsis_os2.h"
+#include "app_time.h"
 
 #include "Peripheral.h"
 #include "wifi_connect.h"
 #include "uart_task9.h"
 #include "task10_servo_distance.h"
-#include "task10_trace.h"
+#include "task10_bluetooth.h"
 #include "task_sensor.h"
 #include "task_wifi.h"
 #include "task_hello.h"
 #include "task_cloud.h"
+#include "task_car_control.h"
+#include "udp_telemetry.h"
+#include "task_encoder_cal.h"
 
 #define WIFI_STA_START_WAIT_MS 6000
 #define CLOUD_VALIDATION_MODE 1
@@ -24,6 +28,7 @@ static void QstCarTask(void)
     uint32_t cloudRetryElapsed = CLOUD_LAUNCH_RETRY_MS;
 
     printf("QST car start\r\n");
+    printf("kernel tick freq = %u Hz\r\n", (unsigned int)osKernelGetTickFreq());
 
     Peripheral_Init();
     TaskWifiInit();
@@ -41,16 +46,12 @@ static void QstCarTask(void)
 
     /* UART2 is initialized by Peripheral_Init before its RX tasks start. */
     UartTask9Init();
+    (void)TaskCarControlInit();
+    Task10BluetoothInit();
+    UdpTelemetryInit();
+    EncoderCalInit();
     Task10ServoDistanceInit();
 
-    /*
-     * Cloud validation does not start line-following. That task can issue
-     * motor commands and later starts the Bluetooth task, neither of which
-     * is needed while validating WiFi, sensors, ranging and IoTDA.
-     */
-#if (CLOUD_VALIDATION_MODE == 0)
-    Task10TraceInit();
-#endif
     TaskSensorInit();
 
     printf("Peripheral init done\r\n");
@@ -74,7 +75,7 @@ static void QstCarTask(void)
             }
         }
 
-        osDelay(1000U);
+        osDelay(AppMsToTicks(1000U));
         if (cloudStarted == 0U && cloudRetryElapsed < CLOUD_LAUNCH_RETRY_MS) {
             cloudRetryElapsed += 1000U;
         }
