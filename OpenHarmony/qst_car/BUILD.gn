@@ -36,6 +36,7 @@ static_library("qst_car") {
         "src/task_encoder_two_arc_roundtrip.c",
         "src/task_encoder_segment_b_progress.c",
         "src/task_encoder_bpath_follow.c",
+        "src/task_motor_response.c",
     ]
 
     include_dirs = [

@@ -18,7 +18,8 @@
 #define BPF_READY_FRAMES 20U
 #define BPF_READY_AGE_MS 100U
 #define BPF_RX_TIMEOUT_MS 200U
-#define BPF_REVERSE_TIMEOUT_MS 4000U
+/* Diagnostic safety ceiling only: normal terminal/FOLLOW completion exits earlier. */
+#define BPF_REVERSE_TIMEOUT_MS 30000U
 #define BPF_DIRECTION_WRONG 50
 #define BPF_FINAL_STOP_LEAD 60
 #define BPF_PATH_ERROR_ENTER 20
@@ -48,7 +49,7 @@
 #define BPF_PDIFF_WRONG_DIR 20
 #define BPF_RESALIGN_IDLE_MS 1000U
 #define BPF_RESALIGN_TIMEOUT_MS 15000U
-#define BPF_MAX_POINTS 128U
+#define BPF_MAX_POINTS 512U
 
 typedef enum { BPF_WAIT = 0, BPF_ARM, BPF_FORWARD_A, BPF_FORWARD_B,
                BPF_FORWARD_SETTLE, BPF_REVERSE_PAUSE, BPF_REVERSE,
@@ -88,7 +89,7 @@ typedef struct {
     int32_t terminalStopLeft, terminalStopRight;
     int32_t terminalStopRemainingLeft, terminalStopRemainingRight, terminalStopRemainingS;
     uint32_t fStartFrames, fEndFrames, rStartFrames, rEndFrames;
-    uint32_t fFrames, rFrames, fDurationMs, reverseDurationMs;
+    uint32_t fFrames, rFrames, fDurationMs, reverseDurationMs, followElapsedMs;
     uint32_t terminalArmMs, terminalScheduleMs, terminalDelayMs;
     uint32_t terminalActualWaitUs, terminalActualStopMs;
     int32_t scheduleRemainingL, scheduleRemainingR;
@@ -126,7 +127,7 @@ static BpfPathPoint g_followPath[BPF_MAX_POINTS];
 static BpfReferencePoint g_reference[BPF_MAX_POINTS];
 static uint16_t g_forwardCount, g_followCount, g_referenceCount;
 static uint16_t g_forwardDumpIndex, g_followDumpIndex, g_referenceIndex;
-static uint32_t g_stateMs, g_readyBase, g_lastArm, g_lastSummary;
+static uint32_t g_stateMs, g_followStartMs, g_readyBase, g_lastArm, g_lastSummary;
 static uint32_t g_forwardPathStartMs, g_reversePathStartMs;
 static uint32_t g_forwardLastValid, g_reverseLastValid;
 static uint8_t g_forwardOverflow, g_followOverflow;
@@ -166,6 +167,8 @@ static uint32_t g_resStartMs, g_resLastMoveMs, g_resLastLogMs;
 static int32_t g_resStartL, g_resStartR, g_resStartRawL, g_resStartRawR;
 static int32_t g_resLastRawL, g_resLastRawR, g_resLastLogDl, g_resLastLogDr;
 static uint8_t g_resMovementStarted;
+static uint32_t g_externalRecordStopMs;
+static uint8_t g_externalReturnNoPdiff;
 static char g_text[768];
 
 static int32_t BpfAbs(int32_t value) { return value < 0 ? -value : value; }
@@ -215,12 +218,13 @@ static void BpfPublish(const char *event)
 {
     (void)snprintf(g_text, sizeof(g_text),
         "BPATH event=%s mode=FOLLOW target_l=%ld target_r=%ld reverse_l=%ld reverse_r=%ld "
-        "error_l=%ld error_r=%ld max_path_err=%ld terminal_arm_ms=%u terminal_schedule_ms=%u "
+        "error_l=%ld error_r=%ld follow_elapsed_ms=%u timeout_ms=%u max_path_err=%ld terminal_arm_ms=%u terminal_schedule_ms=%u "
         "terminal_delay_ms=%u terminal_vs30=%ld terminal_predicted_coast_s=%ld "
         "terminal_fallback=%u valid=%u aborted=%u reason=%s",
         event, (long)g_result.bLeft, (long)g_result.bRight,
         (long)g_result.reverseLeft, (long)g_result.reverseRight,
         (long)g_result.errorLeft, (long)g_result.errorRight,
+        (unsigned int)g_result.followElapsedMs, (unsigned int)BPF_REVERSE_TIMEOUT_MS,
         (long)g_result.maxAbsPathErrorTicks, (unsigned int)g_result.terminalArmMs,
         (unsigned int)g_result.terminalScheduleMs, (unsigned int)g_result.terminalDelayMs,
         (long)g_result.terminalVs30, (long)g_result.terminalPredictedCoastS,
@@ -407,7 +411,8 @@ static int BpfBuildReference(void)
 static void BpfStartFollowPath(const UdpEncoderTelemetryState *encoder, uint32_t ms)
 {
     g_followCount = 0U; g_followOverflow = 0U; g_reverseLastValid = encoder->validCount;
-    g_reversePathStartMs = ms;
+    g_reversePathStartMs = g_followStartMs = ms;
+    g_result.followElapsedMs = 0U;
     BpfPathAdd(g_followPath, &g_followCount, &g_followOverflow, BPF_FOLLOW_ACTIVE,
                encoder->sequence, 0U, 0, 0, 0, 0, 0, 0U, 0, 0);
 }
@@ -440,6 +445,7 @@ static void BpfFinalizeResult(const UdpEncoderTelemetryState *encoder, uint32_t 
     g_result.reverseLeft = encoder->totalLeft - g_result.rStartL;
     g_result.reverseRight = encoder->totalRight - g_result.rStartR;
     g_result.rFrames = encoder->validCount - g_result.rStartFrames;
+    g_result.followElapsedMs = ms - g_followStartMs;
     g_result.errorLeft = g_result.bLeft + g_result.reverseLeft;
     g_result.errorRight = g_result.bRight + g_result.reverseRight;
     g_result.errorLeftPermille = g_result.errorLeft * 1000 / g_result.bLeft;
@@ -550,7 +556,7 @@ static void BpfPumpDump(void)
     } else if (g_dumpState == BPF_DUMP_RESULT) {
         (void)snprintf(g_text, sizeof(g_text),
             "BPATH event=RESULT mode=FOLLOW target_l=%ld target_r=%ld reverse_l=%ld reverse_r=%ld "
-            "error_l=%ld error_r=%ld error_s=%ld max_path_err=%ld follow_ms=%u "
+            "error_l=%ld error_r=%ld error_s=%ld max_path_err=%ld follow_elapsed_ms=%u timeout_ms=%u "
             "terminal_arm_ms=%u terminal_schedule_ms=%u terminal_delay_ms=%u "
             "terminal_remaining_s_at_schedule=%ld terminal_vs30=%ld terminal_predicted_coast_s=%ld "
             "terminal_stop_l=%ld terminal_stop_r=%ld terminal_stop_remaining_l=%ld "
@@ -560,7 +566,8 @@ static void BpfPumpDump(void)
             (long)g_result.bLeft, (long)g_result.bRight, (long)g_result.reverseLeft,
             (long)g_result.reverseRight, (long)g_result.errorLeft, (long)g_result.errorRight,
             (long)(g_result.errorLeft + g_result.errorRight), (long)g_result.maxAbsPathErrorTicks,
-            (unsigned int)g_result.reverseDurationMs, (unsigned int)g_result.terminalArmMs,
+            (unsigned int)g_result.followElapsedMs, (unsigned int)BPF_REVERSE_TIMEOUT_MS,
+            (unsigned int)g_result.terminalArmMs,
             (unsigned int)g_result.terminalScheduleMs, (unsigned int)g_result.terminalDelayMs,
             (long)g_result.terminalRemainingSAtSchedule, (long)g_result.terminalVs30,
             (long)g_result.terminalPredictedCoastS, (long)g_result.terminalStopLeft,
@@ -605,7 +612,9 @@ void BPathFollowInit(void)
     g_result = (BpfResult){0}; g_forwardCount = g_followCount = g_referenceCount = 0U;
     g_forwardDumpIndex = g_followDumpIndex = g_referenceIndex = 0U;
     g_forwardOverflow = g_followOverflow = 0U;
-    g_stateMs = g_readyBase = g_lastArm = g_lastSummary = 0U;
+    g_stateMs = g_followStartMs = g_readyBase = g_lastArm = g_lastSummary = 0U;
+    g_forwardPathStartMs = g_reversePathStartMs = 0U;
+    g_forwardLastValid = g_reverseLastValid = 0U;
     g_leftDone = g_rightDone = g_leftPublished = g_rightPublished = 0U;
     g_terminalArmed = g_terminalScheduled = g_terminalStopped = 0U;
     g_terminalExecutionRequestPending = 0U;
@@ -623,8 +632,156 @@ void BPathFollowInit(void)
     g_terminalVector = BPF_TVEC_NONE;
     g_trimPulseStartMs = 0U; g_trimSide = 0U;
     g_trimPreLeft = g_trimPreRight = g_trimPreError = 0;
+    g_manualStartMs = g_manualLastMoveMs = g_manualLastLogMs = 0U;
+    g_manualStartLeft = g_manualStartRight = 0;
+    g_manualStartRawLeft = g_manualStartRawRight = 0;
+    g_manualLastRawLeft = g_manualLastRawRight = 0;
+    g_manualLastLogDL = g_manualLastLogDR = 0;
+    g_manualMovementStarted = 0U;
+    g_pdiffStartL = g_pdiffStartR = g_pdiffStartDiff = g_pdiffLastGain = 0;
+    g_pdiffVNow = g_pdiffVPrev = 0;
+    g_pdiffVSamples = g_pdiffVelocityValid = g_pdiffValid = 0U;
+    g_pdiffStartMs = g_pdiffStopMs = g_pdiffLastLogMs = 0U;
+    g_pdiffPrevValid = 0U; g_pdiffPrevSeq = 0U;
+    g_resStartMs = g_resLastMoveMs = g_resLastLogMs = 0U;
+    g_resStartL = g_resStartR = g_resStartRawL = g_resStartRawR = 0;
+    g_resLastRawL = g_resLastRawR = g_resLastLogDl = g_resLastLogDr = 0;
+    g_resMovementStarted = 0U;
+    g_externalRecordStopMs = 0U;
+    g_externalReturnNoPdiff = 0U;
     g_terminalFrozenLeft = g_terminalFrozenRight = 0;
     BpfPublish("BOOT"); BpfPublish("WAIT_ENCODER");
+}
+
+int BPathFollowIsFinished(void)
+{
+    return g_state == BPF_DONE || g_state == BPF_ABORT;
+}
+
+int BPathExternalRecordStart(uint32_t now)
+{
+    UdpEncoderTelemetryState encoder;
+    uint32_t ms = AppTicksToMs(now);
+
+    UdpTelemetryReadEncoder(&encoder);
+    if (!BpfFresh(&encoder, ms, BPF_RX_TIMEOUT_MS)) {
+        BpfAbort("ENCODER_RX_TIMEOUT");
+        return -1;
+    }
+    g_result.fStartL = g_result.boundaryL = encoder.totalLeft;
+    g_result.fStartR = g_result.boundaryR = encoder.totalRight;
+    g_result.fStartSeq = g_result.boundarySeq = encoder.sequence;
+    g_result.fStartFrames = encoder.validCount;
+    g_forwardCount = 0U;
+    g_forwardOverflow = 0U;
+    g_forwardLastValid = encoder.validCount;
+    g_forwardPathStartMs = ms;
+    BpfPathAdd(g_forwardPath, &g_forwardCount, &g_forwardOverflow, BPF_FWD_ACTIVE,
+               encoder.sequence, 0U, 0, 0, 0, 0, 0, 0U, 0, 0);
+    BpfPublish("TRACE_RECORD_START");
+    return 0;
+}
+
+int BPathExternalRecordStep(uint32_t now)
+{
+    UdpEncoderTelemetryState encoder;
+    uint32_t ms = AppTicksToMs(now);
+
+    UdpTelemetryReadEncoder(&encoder);
+    if (!BpfFresh(&encoder, ms, BPF_RX_TIMEOUT_MS)) {
+        BpfAbort("ENCODER_RX_TIMEOUT");
+        return -1;
+    }
+    if (encoder.validCount == g_forwardLastValid) {
+        return 0;
+    }
+    g_forwardLastValid = encoder.validCount;
+    BpfPathAdd(g_forwardPath, &g_forwardCount, &g_forwardOverflow,
+               g_externalRecordStopMs != 0U ? BPF_FWD_COAST : BPF_FWD_ACTIVE,
+               encoder.sequence, ms - g_forwardPathStartMs,
+               encoder.totalLeft - g_result.fStartL,
+               encoder.totalRight - g_result.fStartR, 0, 0, 0, 0U, 0, 0);
+    if (g_forwardOverflow != 0U) {
+        BpfAbort("FORWARD_OVERFLOW");
+        return -1;
+    }
+    return 0;
+}
+
+void BPathExternalRecordStop(uint32_t now)
+{
+    g_externalRecordStopMs = AppTicksToMs(now);
+    BpfPublish("TRACE_RECORD_STOP");
+}
+
+int BPathExternalHasForwardMovement(void)
+{
+    uint16_t index;
+
+    for (index = 0U; index < g_forwardCount; index++) {
+        if (g_forwardPath[index].left != 0 || g_forwardPath[index].right != 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+void BPathExternalAbort(const char *reason)
+{
+    BpfAbort(reason);
+}
+
+int BPathExternalReturnSettleComplete(uint32_t now)
+{
+    return g_externalRecordStopMs != 0U &&
+           (uint32_t)(AppTicksToMs(now) - g_externalRecordStopMs) >=
+           BPF_FORWARD_SETTLE_MS;
+}
+
+int BPathExternalRecordFinish(uint32_t now)
+{
+    UdpEncoderTelemetryState encoder;
+    uint32_t ms = AppTicksToMs(now);
+
+    if (BPathExternalRecordStep(now) != 0) {
+        return -1;
+    }
+    UdpTelemetryReadEncoder(&encoder);
+    g_result.fEndL = encoder.totalLeft;
+    g_result.fEndR = encoder.totalRight;
+    g_result.fEndSeq = encoder.sequence;
+    g_result.fEndFrames = encoder.validCount;
+    g_result.bLeft = encoder.totalLeft - g_result.fStartL;
+    g_result.bRight = encoder.totalRight - g_result.fStartR;
+    g_result.fFrames = encoder.validCount - g_result.fStartFrames;
+    g_result.fDurationMs = ms - g_forwardPathStartMs;
+    if (g_result.bLeft <= 0 || g_result.bRight <= 0) {
+        BpfAbort("FORWARD_DIRECTION_INVALID");
+        return -1;
+    }
+    BpfFinalForward(ms);
+    if (g_forwardOverflow != 0U || BpfBuildReference() == 0) {
+        g_result.referenceInvalid = 1U;
+        BpfAbort(g_forwardOverflow != 0U ? "FORWARD_OVERFLOW" : "REF_NON_MONOTONIC");
+        return -1;
+    }
+    (void)snprintf(g_text, sizeof(g_text),
+        "BPATH event=TRACE_REF_READY points=%u ref=%u tgt_l=%ld tgt_r=%ld",
+        (unsigned int)g_forwardCount, (unsigned int)g_referenceCount,
+        (long)g_result.bLeft, (long)g_result.bRight);
+    (void)UdpTelemetryQueueExperimentText(g_text);
+    return 0;
+}
+
+int BPathExternalReturnStart(uint32_t now)
+{
+    if (g_referenceCount < 2U || g_state == BPF_ABORT) {
+        return -1;
+    }
+    g_externalReturnNoPdiff = 1U;
+    g_state = BPF_REVERSE_PAUSE;
+    g_stateMs = AppTicksToMs(now);
+    return 0;
 }
 
 void BPathFollowStep(uint32_t now, int *leftCmd, int *rightCmd)
@@ -723,6 +880,12 @@ void BPathFollowStep(uint32_t now, int *leftCmd, int *rightCmd)
             revLeft = encoder.totalLeft - g_result.rStartL;
             revRight = encoder.totalRight - g_result.rStartR;
             leftTravel = -revLeft; rightTravel = -revRight;
+            /* Signed deltas are telemetry only: backward travel is negative. */
+            g_result.reverseLeft = revLeft;
+            g_result.reverseRight = revRight;
+            g_result.errorLeft = g_result.bLeft + revLeft;
+            g_result.errorRight = g_result.bRight + revRight;
+            g_result.followElapsedMs = ms - g_followStartMs;
             if (revLeft > BPF_DIRECTION_WRONG || revRight > BPF_DIRECTION_WRONG) {
                 BpfAbort("ENCODER_DIRECTION_WRONG"); break;
             }
@@ -898,7 +1061,11 @@ void BPathFollowStep(uint32_t now, int *leftCmd, int *rightCmd)
                         (long)(g_result.autoErrorRight - g_result.autoErrorLeft));
                     (void)UdpTelemetryQueueExperimentText(text);
                 }
-                g_state = BPF_PDIFF_PREP; g_stateMs = ms;
+                if (g_externalReturnNoPdiff != 0U) {
+                    BpfFinalizeResult(&encoder, ms);
+                } else {
+                    g_state = BPF_PDIFF_PREP; g_stateMs = ms;
+                }
             }
             break;
         case BPF_PDIFF_PREP:

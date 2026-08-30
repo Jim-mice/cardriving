@@ -6,6 +6,7 @@
 #include "app_time.h"
 #include "wifiiot_uart.h"
 #include "task10_bluetooth.h"
+#include "task_car_control.h"
 
 #define BLUETOOTH_UART              WIFI_IOT_UART_IDX_1
 #define BLE_PROBE_BAUD_9600         9600U
@@ -16,6 +17,46 @@
 
 static volatile int g_bleUartReady;
 static int g_bleTaskStarted;
+
+static void BleHandleControlLine(const char *line)
+{
+    if (strcmp(line, "BPATH START") == 0) {
+        CarControlSubmitBpathCommandFromSource(BPATH_CONTROL_COMMAND_START,
+                                               BPATH_COMMAND_SOURCE_BLE);
+    } else if (strcmp(line, "BPATH RETURN") == 0) {
+        CarControlSubmitBpathCommandFromSource(BPATH_CONTROL_COMMAND_RETURN,
+                                               BPATH_COMMAND_SOURCE_BLE);
+    } else if (strcmp(line, "BPATH RESET") == 0) {
+        CarControlSubmitBpathCommandFromSource(BPATH_CONTROL_COMMAND_RESET,
+                                               BPATH_COMMAND_SOURCE_BLE);
+    }
+}
+
+static void BleHandleControlBytes(const unsigned char *data, int len)
+{
+    static char line[24];
+    static unsigned int lineLength;
+    int index;
+
+    for (index = 0; index < len; index++) {
+        unsigned char byte = data[index];
+
+        if (byte == '\r') {
+            continue;
+        }
+        if (byte == '\n') {
+            line[lineLength] = '\0';
+            BleHandleControlLine(line);
+            lineLength = 0U;
+            continue;
+        }
+        if (byte >= 0x20U && byte <= 0x7eU && lineLength < sizeof(line) - 1U) {
+            line[lineLength++] = (char)byte;
+        } else {
+            lineLength = 0U;
+        }
+    }
+}
 
 static int BleUartConfigure(uint32_t baudRate)
 {
@@ -134,8 +175,11 @@ static void BluetoothTask(void *argument)
     printf("BLE diagnostic UART ready\r\n");
 
     for (;;) {
-        /* Incoming transparent-UART bytes are deliberately ignored. */
-        (void)UartRead(BLUETOOTH_UART, data, sizeof(data));
+        int readLen = UartRead(BLUETOOTH_UART, data, sizeof(data));
+        if (readLen > 0) {
+            /* Only BPATH START, RETURN, and RESET publish owner-thread work. */
+            BleHandleControlBytes(data, readLen);
+        }
         osDelay(AppMsToTicks(BLE_IDLE_READ_PERIOD_MS));
     }
 }

@@ -61,8 +61,7 @@
      (ENCODER_DISTANCE_LEFT_ARC_ROUNDTRIP_TEST_MODE == 1) || \
      (ENCODER_DISTANCE_RIGHT_ARC_ROUNDTRIP_TEST_MODE == 1) || \
      (ENCODER_TWO_ARC_CONTINUOUS_ROUNDTRIP_TEST_MODE == 1) || \
-     (ENCODER_SEGMENT_B_PROGRESS_TEST_MODE == 1) || \
-     (ENCODER_BPATH_FOLLOW_V1_TEST_MODE == 1))
+     (ENCODER_SEGMENT_B_PROGRESS_TEST_MODE == 1))
 #define TRACE_TURNAROUND_TEST_MODE 0
 #define CAR_LINE_CALIBRATION_MODE 0
 #define CAR_STRAIGHT_DIAGNOSTIC_MODE 0
@@ -73,6 +72,10 @@
 #define LINE_SENSOR_CALIBRATION_MODE 0
 
 #define CAR_CONTROL_PERIOD_MS  30U
+#define TRACE_RECORD_DIAG_PERIOD_MS 200U
+#define TRACE_LIVE_FORWARD_PERIOD_MS 60U
+#define TRACE_LIVE_RETURN_PERIOD_MS  100U
+#define LINE_LIVE_PERIOD_MS          60U
 #define MOTOR_COMMAND_HEARTBEAT_MS 200U
 #define MOTOR_HEARTBEAT_LOG_EVERY  5U
 #define CAR_LINE_CALIBRATION_PERIOD_MS 100U
@@ -81,11 +84,18 @@
 #define LINE_SENSOR_ANALYSIS_WINDOW_MS 2000U
 #define LINE_SENSOR_CALIBRATION_PERIOD_MS 100U
 #define TRACE_START_DELAY_MS   2000U
-#define TRACE_RECOVERY_HOLD_MS 200U
+#define TRACE_RECOVERY_HOLD_MS 0U
+#define TRACE_CORRECTION_MIN_HOLD_MS 180U
+#define TRACE_BIAS_WINDOW_MS 1000U
+#define TRACE_BIAS_LONG_CORRECTION_MS 300U
+#define TRACE_BIAS_FWD_MIN_MS 300U
+#define TRACE_BIAS_DOMINANCE_MS 180U
 
 #define TRACE_FORWARD_SPEED    100
-#define TRACE_OUTER_SPEED      120
-#define TRACE_INNER_SPEED      60
+#define TRACE_SLOW_PWM         90
+#define TRACE_FAST_PWM         110
+#define TRACE_OUTER_SPEED      TRACE_FAST_PWM
+#define TRACE_INNER_SPEED      TRACE_SLOW_PWM
 #define TRACE_RECOVER_SPEED    120
 #define TRACE_REVERSE_FORWARD_SPEED 100
 #define TRACE_REVERSE_INNER_SPEED   60
@@ -163,6 +173,613 @@ extern void stm32motor_control(int motorA, int motorB);
 static volatile CarMode g_carMode = CAR_MODE_IDLE;
 static int g_carControlTaskStarted;
 
+/*
+ * LINE_LIVE is deliberately independent from the TRACE debounce and every
+ * BPATH lifecycle state.  It remains a live view of GPIO13/GPIO14 after the
+ * vehicle has stopped, so manual track checks never depend on motor state.
+ */
+static uint8_t g_lineLiveRawLeft;
+static uint8_t g_lineLiveRawRight;
+static uint8_t g_lineLiveCandidateState;
+static uint8_t g_lineLiveCandidateSamples;
+static uint8_t g_lineLiveStableState;
+static uint8_t g_lineLiveStableValid;
+static uint32_t g_lineLiveLastTick;
+static uint32_t g_lineLiveSequence;
+static uint32_t g_lineLiveQueueFailCount;
+static const char *g_lineLivePhase = "BOOT";
+static const char *g_lineLiveAction = "STOP";
+static int g_lineLiveMotorLeft;
+static int g_lineLiveMotorRight;
+static const char *g_lineLiveBias = "NONE";
+static uint32_t g_lineLiveBiasLeftMs;
+static uint32_t g_lineLiveBiasRightMs;
+static uint32_t g_lineLiveBiasFwdMs;
+static const char *g_lineLiveCorrection = "NONE";
+static uint32_t g_lineLiveCorrectionStartTick;
+
+static void LineLiveSetControl(const char *phase, const char *action,
+                               int motorLeft, int motorRight)
+{
+    g_lineLivePhase = phase;
+    g_lineLiveAction = action;
+    g_lineLiveMotorLeft = motorLeft;
+    g_lineLiveMotorRight = motorRight;
+}
+
+static void LineLiveSetCorrection(const char *direction, uint32_t now)
+{
+    g_lineLiveCorrection = direction;
+    g_lineLiveCorrectionStartTick = now;
+}
+
+static void LineLiveUpdateSensor(WifiIotGpioValue left, WifiIotGpioValue right,
+                                 int sensorValid)
+{
+    uint8_t rawState;
+
+    if (sensorValid == 0) {
+        g_lineLiveStableValid = 0U;
+        g_lineLiveCandidateSamples = 0U;
+        return;
+    }
+    g_lineLiveRawLeft = left == WIFI_IOT_GPIO_VALUE1 ? 1U : 0U;
+    g_lineLiveRawRight = right == WIFI_IOT_GPIO_VALUE1 ? 1U : 0U;
+    rawState = (uint8_t)((g_lineLiveRawLeft << 1) | g_lineLiveRawRight);
+    if (rawState != g_lineLiveCandidateState) {
+        g_lineLiveCandidateState = rawState;
+        g_lineLiveCandidateSamples = 1U;
+    } else if (g_lineLiveCandidateSamples < 2U) {
+        g_lineLiveCandidateSamples++;
+    }
+    if (g_lineLiveCandidateSamples >= 2U) {
+        g_lineLiveStableState = g_lineLiveCandidateState;
+        g_lineLiveStableValid = 1U;
+    }
+}
+
+static void LineLivePublish(uint32_t now)
+{
+    char text[192];
+    const char *sensor = "--";
+
+    if ((uint32_t)(now - g_lineLiveLastTick) < AppMsToTicks(LINE_LIVE_PERIOD_MS)) {
+        return;
+    }
+    if (g_lineLiveStableValid != 0U) {
+        static char sensorText[3];
+
+        sensorText[0] = (g_lineLiveStableState & 0x02U) != 0U ? '1' : '0';
+        sensorText[1] = (g_lineLiveStableState & 0x01U) != 0U ? '1' : '0';
+        sensorText[2] = '\0';
+        sensor = sensorText;
+    }
+    g_lineLiveSequence++;
+    (void)snprintf(text, sizeof(text),
+        "LINE_LIVE ms=%u seq=%u raw_l=%u raw_r=%u sensor=%s action=%s phase=%s motor_l=%d motor_r=%d corr_dir=%s corr_ms=%u bias=%s bias_left_ms=%u bias_right_ms=%u bias_fwd_ms=%u queue_fail=%u",
+        (unsigned int)AppTicksToMs(now), (unsigned int)g_lineLiveSequence,
+        (unsigned int)g_lineLiveRawLeft, (unsigned int)g_lineLiveRawRight,
+        sensor, g_lineLiveAction, g_lineLivePhase,
+        g_lineLiveMotorLeft, g_lineLiveMotorRight, g_lineLiveCorrection,
+        g_lineLiveCorrection[0] == 'N' ? 0U : (unsigned int)AppTicksToMs(now - g_lineLiveCorrectionStartTick),
+        g_lineLiveBias, (unsigned int)g_lineLiveBiasLeftMs,
+        (unsigned int)g_lineLiveBiasRightMs, (unsigned int)g_lineLiveBiasFwdMs,
+        (unsigned int)g_lineLiveQueueFailCount);
+    if (UdpTelemetryQueueExperimentText(text) != 0) {
+        g_lineLiveQueueFailCount++;
+    }
+    g_lineLiveLastTick = now;
+}
+
+#if (LINE_SENSOR_SIDE_TEST_MODE == 1) || (TRACE_TRACK_GEOMETRY_TEST_MODE == 1)
+/* Static tests own only an unconditional safe stop from CarControlTask. */
+static void TraceStaticTestForceStop(void)
+{
+    stm32motor_control(0, 0);
+    UdpTelemetryUpdateMotorCommand(0, 0);
+}
+#endif
+
+#if (MOTOR_RESPONSE_TEST_MODE == 1)
+static volatile MotorResponseCommand g_motorResponsePendingCommand;
+#endif
+
+#if (MOTOR_TURN_DIRECTION_TEST_MODE == 1)
+#define MOTOR_TURN_DIRECTION_DURATION_MS 600U
+static volatile MotorTurnDirectionCommand g_motorTurnDirectionPendingCommand;
+static MotorTurnDirectionCommand g_motorTurnDirectionActiveCommand;
+static uint32_t g_motorTurnDirectionStopTick;
+
+static const char *MotorTurnDirectionActionName(MotorTurnDirectionCommand command)
+{
+    if (command == MOTOR_TURN_DIRECTION_COMMAND_LEFT) return "LEFT";
+    if (command == MOTOR_TURN_DIRECTION_COMMAND_RIGHT) return "RIGHT";
+    if (command == MOTOR_TURN_DIRECTION_COMMAND_FORWARD) return "FWD";
+    return "STOP";
+}
+
+static void MotorTurnDirectionPublish(const char *event,
+                                      MotorTurnDirectionCommand command,
+                                      int leftCommand, int rightCommand)
+{
+    char text[112];
+
+    (void)snprintf(text, sizeof(text),
+        "TURNTEST event=%s action=%s cmd_l=%d cmd_r=%d",
+        event, MotorTurnDirectionActionName(command), leftCommand, rightCommand);
+    (void)UdpTelemetryQueueExperimentText(text);
+}
+
+static void MotorTurnDirectionStep(uint32_t now, MotorTurnDirectionCommand command,
+                                   int *leftCommand, int *rightCommand)
+{
+    *leftCommand = 0;
+    *rightCommand = 0;
+
+    if (command == MOTOR_TURN_DIRECTION_COMMAND_STOP) {
+        if (g_motorTurnDirectionActiveCommand != MOTOR_TURN_DIRECTION_COMMAND_NONE) {
+            MotorTurnDirectionPublish("STOP", g_motorTurnDirectionActiveCommand, 0, 0);
+        }
+        g_motorTurnDirectionActiveCommand = MOTOR_TURN_DIRECTION_COMMAND_NONE;
+        return;
+    }
+
+    if (g_motorTurnDirectionActiveCommand == MOTOR_TURN_DIRECTION_COMMAND_NONE &&
+        command != MOTOR_TURN_DIRECTION_COMMAND_NONE) {
+        int startLeft = 0;
+        int startRight = 0;
+
+        if (command == MOTOR_TURN_DIRECTION_COMMAND_LEFT) {
+            startLeft = 90;
+            startRight = 110;
+        } else if (command == MOTOR_TURN_DIRECTION_COMMAND_RIGHT) {
+            startLeft = 110;
+            startRight = 90;
+        } else if (command == MOTOR_TURN_DIRECTION_COMMAND_FORWARD) {
+            startLeft = 100;
+            startRight = 100;
+        }
+        if (startLeft != 0 || startRight != 0) {
+            g_motorTurnDirectionActiveCommand = command;
+            g_motorTurnDirectionStopTick = now +
+                AppMsToTicks(MOTOR_TURN_DIRECTION_DURATION_MS);
+            MotorTurnDirectionPublish("START", command, startLeft, startRight);
+        }
+    }
+
+    if (g_motorTurnDirectionActiveCommand != MOTOR_TURN_DIRECTION_COMMAND_NONE) {
+        if ((int32_t)(now - g_motorTurnDirectionStopTick) >= 0) {
+            MotorTurnDirectionPublish("STOP", g_motorTurnDirectionActiveCommand, 0, 0);
+            g_motorTurnDirectionActiveCommand = MOTOR_TURN_DIRECTION_COMMAND_NONE;
+        } else if (g_motorTurnDirectionActiveCommand == MOTOR_TURN_DIRECTION_COMMAND_LEFT) {
+            *leftCommand = 90;
+            *rightCommand = 110;
+        } else if (g_motorTurnDirectionActiveCommand == MOTOR_TURN_DIRECTION_COMMAND_RIGHT) {
+            *leftCommand = 110;
+            *rightCommand = 90;
+        } else {
+            *leftCommand = 100;
+            *rightCommand = 100;
+        }
+    }
+}
+#endif
+
+#if (ENCODER_BPATH_FOLLOW_V1_TEST_MODE == 1) && (LINE_SENSOR_SIDE_TEST_MODE == 0)
+static uint8_t g_traceRecordDiagStartPending;
+static uint32_t g_traceRecordDiagLastTick;
+
+typedef enum {
+    BPATH_CONTROL_DISARMED = 0,
+    BPATH_CONTROL_TRACE_ARM,
+    BPATH_CONTROL_TRACE_RECORD,
+    BPATH_CONTROL_RETURN_SETTLE,
+    BPATH_CONTROL_BPATH_RETURN,
+    BPATH_CONTROL_DONE
+} BpathControlState;
+
+static volatile BpathControlCommand g_bpathPendingCommand;
+static volatile BpathCommandSource g_bpathPendingSource;
+static BpathControlState g_bpathControlState = BPATH_CONTROL_DISARMED;
+static uint8_t g_bpathAutoBootRun;
+static uint8_t g_manualReturnAuthorized;
+static uint8_t g_manualReturnPipelineActive;
+static uint8_t g_bpathAbortStop;
+static const char *g_returnTrigger = "NONE";
+static uint32_t g_traceLiveLastTick;
+static uint8_t g_autoReturn11Active;
+static uint32_t g_autoReturn11StartTick;
+static void TraceResetState11Counter(void);
+static void TraceClearActiveCorrection(void);
+static void TraceBiasReset(uint32_t now);
+static void TraceCurveReset(void);
+static void TraceCurveEnd(uint32_t now, const char *reason);
+
+static void BpathControlPublish(const char *event)
+{
+    (void)UdpTelemetryQueueExperimentText(event);
+}
+
+static const char *BpathCommandSourceName(BpathCommandSource source)
+{
+    if (source == BPATH_COMMAND_SOURCE_UDP) return "UDP";
+    if (source == BPATH_COMMAND_SOURCE_BLE) return "BLE";
+    return "NONE";
+}
+
+static int BpathControlEncoderReady(void)
+{
+    UdpEncoderTelemetryState encoder;
+
+    UdpTelemetryReadEncoder(&encoder);
+    return encoder.validCount != 0U;
+}
+
+static void AutoReturn11Reset(void)
+{
+    g_autoReturn11Active = 0U;
+    g_autoReturn11StartTick = 0U;
+}
+
+static void BpathControlFinish(void)
+{
+    if (g_bpathControlState != BPATH_CONTROL_DONE) {
+        TraceCurveEnd(osKernelGetTickCount(), g_bpathAbortStop != 0U ? "ABORT" : "DONE");
+        g_bpathControlState = BPATH_CONTROL_DONE;
+        g_manualReturnAuthorized = 0U;
+        g_manualReturnPipelineActive = 0U;
+        g_returnTrigger = "NONE";
+        AutoReturn11Reset();
+        TraceResetState11Counter();
+        TraceClearActiveCorrection();
+        TraceBiasReset(0U);
+        if (g_bpathAbortStop != 0U) {
+            LineLiveSetControl("ABORT", "STOP", 0, 0);
+        } else {
+            LineLiveSetControl("DONE", "DONE", 0, 0);
+        }
+        BpathControlPublish("BPATHCTL event=COMPLETE state=DONE");
+    }
+}
+
+static void BpathControlAbort(const char *reason)
+{
+    char text[128];
+
+    g_bpathAbortStop = 1U;
+    LineLiveSetControl("ABORT", "STOP", 0, 0);
+    (void)snprintf(text, sizeof(text), "BPATHCTL event=ABORT reason=%s", reason);
+    BpathControlPublish(text);
+    BpathControlFinish();
+}
+
+static void BpathControlReturnGuardBlock(const char *fromState,
+                                         const char *requestedState)
+{
+    char text[176];
+
+    g_manualReturnAuthorized = 0U;
+    g_manualReturnPipelineActive = 0U;
+    g_returnTrigger = "NONE";
+    g_bpathAutoBootRun = 0U;
+    TraceCurveEnd(osKernelGetTickCount(), "ABORT");
+    g_bpathControlState = BPATH_CONTROL_DISARMED;
+    g_bpathAbortStop = 0U;
+    LineLiveSetControl("DISARMED", "STOP", 0, 0);
+    TraceClearActiveCorrection();
+    TraceBiasReset(0U);
+    (void)snprintf(text, sizeof(text),
+        "BPATHCTL event=RETURN_GUARD_BLOCK reason=NO_MANUAL_REQUEST from_state=%s requested_state=%s",
+        fromState, requestedState);
+    BpathControlPublish(text);
+}
+
+static void TraceLivePublish(uint32_t now, const char *sensor, const char *action,
+                             int leftCommand, int rightCommand, const char *phase,
+                             uint32_t periodMs, int force)
+{
+    (void)now;
+    (void)sensor;
+    (void)periodMs;
+    (void)force;
+    /* Legacy callers now only update the always-on LINE_LIVE snapshot. */
+    LineLiveSetControl(phase, action, leftCommand, rightCommand);
+}
+
+static void BpathControlBeginRun(uint8_t autoBoot)
+{
+    BPathFollowInit();
+    g_bpathAutoBootRun = autoBoot;
+    g_manualReturnAuthorized = 0U;
+    g_manualReturnPipelineActive = 0U;
+    g_bpathAbortStop = 0U;
+    g_returnTrigger = "NONE";
+    g_bpathControlState = BPATH_CONTROL_TRACE_ARM;
+    g_traceLiveLastTick = 0U;
+    LineLiveSetControl("BOOT", "STOP", 0, 0);
+    AutoReturn11Reset();
+    TraceResetState11Counter();
+    TraceClearActiveCorrection();
+    TraceBiasReset(osKernelGetTickCount());
+    TraceCurveReset();
+    BpathControlPublish(autoBoot != 0U ?
+        "BPATHCTL event=AUTO_START state=TRACE_ARM" :
+        "BPATHCTL event=START state=TRACE_ARM");
+}
+
+static int BpathControlBeginReturn(uint32_t now)
+{
+    char text[128];
+
+    if (g_manualReturnAuthorized == 0U) {
+        BpathControlReturnGuardBlock("TRACE_RECORD", "RETURN_SETTLE");
+        return -1;
+    }
+    /* A fresh RETURN command grants exactly this one state transition. */
+    g_manualReturnAuthorized = 0U;
+    g_manualReturnPipelineActive = 1U;
+    TraceCurveEnd(now, "RETURN");
+    AutoReturn11Reset();
+    TraceResetState11Counter();
+    TraceClearActiveCorrection();
+    TraceBiasReset(now);
+    BPathExternalRecordStop(now);
+    g_bpathControlState = BPATH_CONTROL_RETURN_SETTLE;
+    LineLiveSetControl("RETURN_SETTLE", "RETURN_SETTLE", 0, 0);
+    (void)snprintf(text, sizeof(text),
+        "BPATHCTL event=RETURN state=RETURN_SETTLE trigger=MANUAL_%s",
+        g_returnTrigger);
+    BpathControlPublish(text);
+    return 0;
+}
+
+static void TraceLivePublishManualReturnTrigger(uint32_t now, const char *trigger)
+{
+    (void)now;
+    (void)trigger;
+    LineLiveSetControl("RETURN_SETTLE", "RETURN_TRIGGER", 0, 0);
+}
+
+static int BpathControlBeginTraceRecord(uint32_t now)
+{
+    if (g_bpathControlState != BPATH_CONTROL_TRACE_ARM) {
+        return -1;
+    }
+    if (BPathExternalRecordStart(now) != 0) {
+        BpathControlAbort("RECORD_START_FAILURE");
+        return -1;
+    }
+    g_bpathControlState = BPATH_CONTROL_TRACE_RECORD;
+    g_traceRecordDiagStartPending = 1U;
+    g_traceRecordDiagLastTick = 0U;
+    return 0;
+}
+
+#if (LINE_SENSOR_ANALYSIS_MODE == 0) && (LINE_SENSOR_CALIBRATION_MODE == 0) && \
+    (CAR_LINE_CALIBRATION_MODE == 0) && \
+    (STM32_UART_LINK_TEST_MODE == 0) && \
+    (LINE_SENSOR_SIDE_TEST_MODE == 0)
+static void TraceResetRecovery(void);
+#endif
+
+static void BpathControlConsumeCommand(uint32_t now)
+{
+    BpathControlCommand command = g_bpathPendingCommand;
+    BpathCommandSource source = g_bpathPendingSource;
+
+    if (command == BPATH_CONTROL_COMMAND_NONE) {
+        return;
+    }
+    g_bpathPendingCommand = BPATH_CONTROL_COMMAND_NONE;
+    g_bpathPendingSource = BPATH_COMMAND_SOURCE_NONE;
+
+    if (command == BPATH_CONTROL_COMMAND_START) {
+        if (g_bpathControlState == BPATH_CONTROL_DISARMED) {
+            BpathControlBeginRun(0U);
+        } else if (g_bpathControlState == BPATH_CONTROL_TRACE_ARM ||
+                   g_bpathControlState == BPATH_CONTROL_TRACE_RECORD ||
+                   g_bpathControlState == BPATH_CONTROL_RETURN_SETTLE ||
+                   g_bpathControlState == BPATH_CONTROL_BPATH_RETURN) {
+            BpathControlPublish("BPATHCTL event=IGNORE cmd=START reason=ALREADY_RUNNING");
+        } else {
+            BpathControlPublish("BPATHCTL event=IGNORE cmd=START reason=NOT_DISARMED");
+        }
+    } else if (command == BPATH_CONTROL_COMMAND_RETURN) {
+        if (g_bpathControlState == BPATH_CONTROL_TRACE_RECORD) {
+            if (source == BPATH_COMMAND_SOURCE_UDP || source == BPATH_COMMAND_SOURCE_BLE) {
+                char text[128];
+
+                (void)snprintf(text, sizeof(text),
+                    "BPATHCTL event=RETURN_ACCEPT source=%s from_state=TRACE_RECORD",
+                    BpathCommandSourceName(source));
+                BpathControlPublish(text);
+                g_manualReturnAuthorized = 1U;
+                g_returnTrigger = source == BPATH_COMMAND_SOURCE_UDP ?
+                    "UDP" : "BLE";
+                if (BpathControlBeginReturn(now) == 0) {
+                    TraceLivePublishManualReturnTrigger(now, g_returnTrigger);
+                }
+            } else {
+                BpathControlPublish("BPATHCTL event=IGNORE cmd=RETURN reason=NO_FRESH_SOURCE");
+            }
+        } else {
+            BpathControlPublish("BPATHCTL event=IGNORE cmd=RETURN reason=NOT_FORWARD_ACTIVE");
+        }
+    } else if (command == BPATH_CONTROL_COMMAND_RESET) {
+        TraceCurveEnd(now, "RESET");
+        BPathFollowInit();
+        g_bpathAutoBootRun = 0U;
+        g_manualReturnAuthorized = 0U;
+        g_manualReturnPipelineActive = 0U;
+        g_bpathAbortStop = 0U;
+        g_returnTrigger = "NONE";
+        g_traceLiveLastTick = 0U;
+        AutoReturn11Reset();
+        TraceResetState11Counter();
+        TraceClearActiveCorrection();
+        TraceBiasReset(now);
+        TraceCurveReset();
+#if (LINE_SENSOR_ANALYSIS_MODE == 0) && (LINE_SENSOR_CALIBRATION_MODE == 0) && \
+    (CAR_LINE_CALIBRATION_MODE == 0) && \
+    (STM32_UART_LINK_TEST_MODE == 0) && \
+    (LINE_SENSOR_SIDE_TEST_MODE == 0)
+        TraceResetRecovery();
+#endif
+        g_bpathControlState = BPATH_CONTROL_DISARMED;
+        LineLiveSetControl("DISARMED", "STOP", 0, 0);
+        BpathControlPublish("BPATHCTL event=RESET state=DISARMED");
+    }
+}
+#endif
+
+#if (TRACE_OBSERVER_TEST_MODE == 1) && (ENCODER_BPATH_FOLLOW_V1_TEST_MODE == 1) && \
+    (LINE_SENSOR_SIDE_TEST_MODE == 0)
+#define TRACE_OBSERVER_TELEMETRY_MS 50U
+typedef enum {
+    TRACE_OBSERVER_CORRECTION_NONE = 0,
+    TRACE_OBSERVER_CORRECTION_LEFT,
+    TRACE_OBSERVER_CORRECTION_RIGHT
+} TraceObserverCorrection;
+
+static volatile TraceObserverCommand g_traceObserverPendingCommand;
+static int g_traceObserverActive;
+static uint8_t g_traceObserverStableState;
+static uint8_t g_traceObserverCandidateState;
+static uint8_t g_traceObserverCandidateSamples;
+static int g_traceObserverStableValid;
+static TraceObserverCorrection g_traceObserverLastCorrection;
+static uint32_t g_traceObserverLastTelemetryTick;
+
+static const char *TraceObserverCorrectionName(TraceObserverCorrection correction)
+{
+    if (correction == TRACE_OBSERVER_CORRECTION_LEFT) return "LEFT";
+    if (correction == TRACE_OBSERVER_CORRECTION_RIGHT) return "RIGHT";
+    return "NONE";
+}
+
+static void TraceObserverReset(void)
+{
+    g_traceObserverStableState = 0U;
+    g_traceObserverCandidateState = 0U;
+    g_traceObserverCandidateSamples = 0U;
+    g_traceObserverStableValid = 0;
+    g_traceObserverLastCorrection = TRACE_OBSERVER_CORRECTION_NONE;
+    g_traceObserverLastTelemetryTick = 0U;
+}
+
+static void TraceObserverPublishControl(const char *event)
+{
+    (void)UdpTelemetryQueueExperimentText(event);
+}
+
+static void TraceObserverStop(const char *reason)
+{
+    char text[96];
+
+    TraceObserverReset();
+    g_traceObserverActive = 0;
+    if (reason == NULL) {
+        TraceObserverPublishControl("TRACEOBSCTL event=STOP");
+    } else {
+        (void)snprintf(text, sizeof(text), "TRACEOBSCTL event=STOP reason=%s", reason);
+        TraceObserverPublishControl(text);
+    }
+}
+
+static void TraceObserverConsumeCommand(void)
+{
+    TraceObserverCommand command = g_traceObserverPendingCommand;
+
+    if (command == TRACE_OBSERVER_COMMAND_NONE) {
+        return;
+    }
+    g_traceObserverPendingCommand = TRACE_OBSERVER_COMMAND_NONE;
+    if (command == TRACE_OBSERVER_COMMAND_START) {
+        if (g_traceObserverActive != 0) {
+            TraceObserverPublishControl("TRACEOBSCTL event=IGNORE reason=ALREADY_RUNNING");
+            return;
+        }
+        /* Observer must never inherit an active BPATH workflow or its recorder. */
+        g_bpathControlState = BPATH_CONTROL_DISARMED;
+        TraceObserverReset();
+        g_traceObserverActive = 1;
+        TraceObserverPublishControl("TRACEOBSCTL event=START");
+    } else if (command == TRACE_OBSERVER_COMMAND_STOP) {
+        TraceObserverStop(NULL);
+    }
+}
+
+static void TraceObserverUpdateStableState(WifiIotGpioValue left, WifiIotGpioValue right)
+{
+    uint8_t rawState = 0U;
+
+    if (left == WIFI_IOT_GPIO_VALUE1) rawState |= 0x02U;
+    if (right == WIFI_IOT_GPIO_VALUE1) rawState |= 0x01U;
+    if (g_traceObserverCandidateSamples == 0U || rawState != g_traceObserverCandidateState) {
+        g_traceObserverCandidateState = rawState;
+        g_traceObserverCandidateSamples = 1U;
+        return;
+    }
+    if (g_traceObserverCandidateSamples < 2U) {
+        g_traceObserverCandidateSamples++;
+    }
+    if (g_traceObserverCandidateSamples == 2U &&
+        (g_traceObserverStableValid == 0 ||
+         g_traceObserverStableState != g_traceObserverCandidateState)) {
+        g_traceObserverStableState = g_traceObserverCandidateState;
+        g_traceObserverStableValid = 1;
+    }
+}
+
+static const char *TraceObserverWouldAction(void)
+{
+    if (g_traceObserverStableState == 0x02U) {
+        g_traceObserverLastCorrection = TRACE_OBSERVER_CORRECTION_LEFT;
+        return "WOULD_LEFT";
+    }
+    if (g_traceObserverStableState == 0x01U) {
+        g_traceObserverLastCorrection = TRACE_OBSERVER_CORRECTION_RIGHT;
+        return "WOULD_RIGHT";
+    }
+    if (g_traceObserverStableState == 0x03U) {
+        if (g_traceObserverLastCorrection == TRACE_OBSERVER_CORRECTION_LEFT) {
+            return "WOULD_HOLD_LEFT";
+        }
+        if (g_traceObserverLastCorrection == TRACE_OBSERVER_CORRECTION_RIGHT) {
+            return "WOULD_HOLD_RIGHT";
+        }
+        return "WOULD_CENTER";
+    }
+    return "WOULD_FWD";
+}
+
+static void TraceObserverStep(uint32_t now, WifiIotGpioValue rawLeft,
+                              WifiIotGpioValue rawRight)
+{
+    char text[224];
+    const char *action;
+
+    TraceObserverUpdateStableState(rawLeft, rawRight);
+    /* Keep observer history current on every fresh 30 ms sample, not just on publish. */
+    action = TraceObserverWouldAction();
+    if ((uint32_t)(now - g_traceObserverLastTelemetryTick) <
+        AppMsToTicks(TRACE_OBSERVER_TELEMETRY_MS)) {
+        return;
+    }
+    (void)snprintf(text, sizeof(text),
+        "TRACE_OBS ms=%u raw_l=%d raw_r=%d stable_l=%u stable_r=%u sensor=%u%u action=%s last_corr=%s motor_l=0 motor_r=0",
+        (unsigned int)AppTicksToMs(now), (int)rawLeft, (int)rawRight,
+        (unsigned int)((g_traceObserverStableState >> 1) & 0x01U),
+        (unsigned int)(g_traceObserverStableState & 0x01U),
+        (unsigned int)((g_traceObserverStableState >> 1) & 0x01U),
+        (unsigned int)(g_traceObserverStableState & 0x01U),
+        action,
+        TraceObserverCorrectionName(g_traceObserverLastCorrection));
+    (void)UdpTelemetryQueueExperimentText(text);
+    g_traceObserverLastTelemetryTick = now;
+}
+#endif
+
 #if (LINE_SENSOR_ANALYSIS_MODE == 0) && (LINE_SENSOR_CALIBRATION_MODE == 0) && \
     (CAR_LINE_CALIBRATION_MODE == 0) && \
     (STM32_UART_LINK_TEST_MODE == 0) && \
@@ -182,7 +799,10 @@ typedef enum {
     TRACE_ACTION_RECOVER_RIGHT,
     TRACE_ACTION_HOLD_LEFT,
     TRACE_ACTION_HOLD_RIGHT,
-    TRACE_ACTION_RECOVER_CENTER
+    TRACE_ACTION_RECOVER_CENTER,
+    TRACE_ACTION_RIGHT_11,
+    TRACE_ACTION_COUNTER_LEFT,
+    TRACE_ACTION_COUNTER_RIGHT
 } TraceAction;
 
 static TraceCorrection g_lastCorrection;
@@ -196,6 +816,104 @@ static uint8_t g_stableState;
 static uint8_t g_candidateState;
 static uint8_t g_candidateSamples;
 static int g_stableStateValid;
+static uint8_t g_state11CounterActive;
+static TraceCorrection g_state11CounterDirection;
+static TraceCorrection g_activeCorrectionDirection;
+static uint32_t g_activeCorrectionStartTick;
+typedef enum { TRACE_BIAS_NONE = 0, TRACE_BIAS_LEFT, TRACE_BIAS_RIGHT } TraceBias;
+static TraceBias g_traceBias;
+static TraceBias g_traceBiasApplied;
+static uint32_t g_traceBiasWindowStartTick;
+static uint32_t g_traceBiasLastTick;
+static uint32_t g_traceBiasLeftMs;
+static uint32_t g_traceBiasRightMs;
+static uint32_t g_traceBiasFwdMs;
+static uint8_t g_traceBiasLongCorrection;
+static TraceCorrection g_traceBiasCorrectionDirection;
+static uint32_t g_traceBiasCorrectionStartTick;
+
+static void TraceBiasReset(uint32_t now)
+{
+    g_traceBias = TRACE_BIAS_NONE;
+    g_traceBiasApplied = TRACE_BIAS_NONE;
+    g_traceBiasWindowStartTick = now;
+    g_traceBiasLastTick = now;
+    g_traceBiasLeftMs = g_traceBiasRightMs = g_traceBiasFwdMs = 0U;
+    g_traceBiasLongCorrection = 0U;
+    g_traceBiasCorrectionDirection = TRACE_CORRECTION_NONE;
+    g_traceBiasCorrectionStartTick = 0U;
+    g_lineLiveBias = "NONE";
+    g_lineLiveBiasLeftMs = g_lineLiveBiasRightMs = g_lineLiveBiasFwdMs = 0U;
+}
+
+static void TraceBiasObserve(TraceAction action)
+{
+    uint32_t now = osKernelGetTickCount();
+    uint32_t elapsed = AppTicksToMs(now - g_traceBiasLastTick);
+    TraceCorrection direction = TRACE_CORRECTION_NONE;
+    char text[160];
+
+    g_traceBiasLastTick = now;
+    if (g_bpathControlState != BPATH_CONTROL_TRACE_RECORD) return;
+    if (action == TRACE_ACTION_LEFT || action == TRACE_ACTION_RECOVER_LEFT) {
+        g_traceBiasLeftMs += elapsed;
+        direction = TRACE_CORRECTION_LEFT;
+    } else if (action == TRACE_ACTION_RIGHT || action == TRACE_ACTION_RECOVER_RIGHT ||
+               action == TRACE_ACTION_RIGHT_11) {
+        g_traceBiasRightMs += elapsed;
+        direction = TRACE_CORRECTION_RIGHT;
+    } else if (action == TRACE_ACTION_FORWARD) {
+        g_traceBiasFwdMs += elapsed;
+    }
+    if (direction == TRACE_CORRECTION_NONE) {
+        g_traceBiasCorrectionDirection = TRACE_CORRECTION_NONE;
+        g_traceBiasCorrectionStartTick = 0U;
+    } else if (direction != g_traceBiasCorrectionDirection) {
+        g_traceBiasCorrectionDirection = direction;
+        g_traceBiasCorrectionStartTick = now;
+    }
+    if (g_traceBiasCorrectionDirection != TRACE_CORRECTION_NONE &&
+        AppTicksToMs(now - g_traceBiasCorrectionStartTick) >= TRACE_BIAS_LONG_CORRECTION_MS) {
+        g_traceBiasLongCorrection = 1U;
+    }
+    g_lineLiveBiasLeftMs = g_traceBiasLeftMs;
+    g_lineLiveBiasRightMs = g_traceBiasRightMs;
+    g_lineLiveBiasFwdMs = g_traceBiasFwdMs;
+    if (AppTicksToMs(now - g_traceBiasWindowStartTick) < TRACE_BIAS_WINDOW_MS) return;
+    if (g_traceBiasLongCorrection == 0U && g_traceBiasFwdMs >= TRACE_BIAS_FWD_MIN_MS) {
+        if (g_traceBiasLeftMs >= g_traceBiasRightMs + TRACE_BIAS_DOMINANCE_MS) g_traceBias = TRACE_BIAS_LEFT;
+        else if (g_traceBiasRightMs >= g_traceBiasLeftMs + TRACE_BIAS_DOMINANCE_MS) g_traceBias = TRACE_BIAS_RIGHT;
+        else g_traceBias = TRACE_BIAS_NONE;
+    } else {
+        g_traceBias = TRACE_BIAS_NONE;
+    }
+    g_lineLiveBias = g_traceBias == TRACE_BIAS_LEFT ? "LEFT" :
+                     g_traceBias == TRACE_BIAS_RIGHT ? "RIGHT" : "NONE";
+    (void)snprintf(text, sizeof(text),
+        "TRACE_BIAS event=UPDATE bias=%s left_ms=%u right_ms=%u fwd_ms=%u fwd_cmd_l=%d fwd_cmd_r=%d",
+        g_lineLiveBias, (unsigned int)g_traceBiasLeftMs, (unsigned int)g_traceBiasRightMs,
+        (unsigned int)g_traceBiasFwdMs,
+        g_traceBias == TRACE_BIAS_LEFT ? 99 : g_traceBias == TRACE_BIAS_RIGHT ? 101 : 100,
+        g_traceBias == TRACE_BIAS_LEFT ? 101 : g_traceBias == TRACE_BIAS_RIGHT ? 99 : 100);
+    (void)UdpTelemetryQueueExperimentText(text);
+    g_traceBiasWindowStartTick = now;
+    g_traceBiasLeftMs = g_traceBiasRightMs = g_traceBiasFwdMs = 0U;
+    g_traceBiasLongCorrection = 0U;
+}
+
+#if (TRACE_STEP_RESPONSE_TEST_MODE == 1)
+#define TRACE_STEP_RESPONSE_COAST_MS 500U
+typedef enum {
+    TRACE_STEP_RESPONSE_IDLE = 0,
+    TRACE_STEP_RESPONSE_PULSE,
+    TRACE_STEP_RESPONSE_COAST
+} TraceStepResponseState;
+
+static volatile TraceStepResponseCommand g_traceStepResponsePendingCommand;
+static TraceStepResponseState g_traceStepResponseState;
+static TraceStepResponseCommand g_traceStepResponseActiveCommand;
+static uint32_t g_traceStepResponseStartTick;
+#endif
 
 #if (REVERSE_REPLAY_STRAIGHT_TEST_MODE == 1)
 typedef struct {
@@ -383,10 +1101,16 @@ static UdpTelemetryAction TraceToUdpTelemetryAction(TraceAction action)
             return UDP_TELEMETRY_ACTION_RECOVER_LEFT;
         case TRACE_ACTION_RECOVER_RIGHT:
             return UDP_TELEMETRY_ACTION_RECOVER_RIGHT;
+        case TRACE_ACTION_RIGHT_11:
+            return UDP_TELEMETRY_ACTION_RIGHT;
         case TRACE_ACTION_HOLD_LEFT:
             return UDP_TELEMETRY_ACTION_HOLD_LEFT;
         case TRACE_ACTION_HOLD_RIGHT:
             return UDP_TELEMETRY_ACTION_HOLD_RIGHT;
+        case TRACE_ACTION_COUNTER_LEFT:
+            return UDP_TELEMETRY_ACTION_LEFT;
+        case TRACE_ACTION_COUNTER_RIGHT:
+            return UDP_TELEMETRY_ACTION_RIGHT;
         case TRACE_ACTION_RECOVER_CENTER:
             return UDP_TELEMETRY_ACTION_HOLD_CENTER;
         default:
@@ -433,7 +1157,10 @@ static void TraceSendMotorCommand(int leftCommand, int rightCommand, int heartbe
     }
 }
 
-#if (ENCODER_ONLY_EXPERIMENT_MODE == 1)
+#if (ENCODER_ONLY_EXPERIMENT_MODE == 1) || \
+    (ENCODER_BPATH_FOLLOW_V1_TEST_MODE == 1) || \
+    (MOTOR_RESPONSE_TEST_MODE == 1) || \
+    (LINE_SENSOR_SIDE_TEST_MODE == 1)
 /* Encoder experiments remain owned by TaskCarControl, but deliberately bypass
  * TRACE/replay semantics. Keep the generic telemetry snapshot truthful. */
 static void EncoderExperimentSendMotorCommand(int leftCommand, int rightCommand,
@@ -466,22 +1193,25 @@ static void TraceBleDiagAction(TraceAction action)
             (void)BleUartSendString("LINE 00 FORWARD 100 100\r\n");
             break;
         case TRACE_ACTION_LEFT:
-            (void)BleUartSendString("LINE 10 LEFT 60 120\r\n");
+            (void)BleUartSendString("LINE 10 LEFT 100 120\r\n");
             break;
         case TRACE_ACTION_RIGHT:
-            (void)BleUartSendString("LINE 01 RIGHT 120 60\r\n");
+            (void)BleUartSendString("LINE 01 RIGHT 120 100\r\n");
             break;
         case TRACE_ACTION_RECOVER_LEFT:
-            (void)BleUartSendString("LINE 00 RECOVER_LEFT 60 120\r\n");
+            (void)BleUartSendString("LINE 00 RECOVER_LEFT 100 120\r\n");
             break;
         case TRACE_ACTION_RECOVER_RIGHT:
-            (void)BleUartSendString("LINE 00 RECOVER_RIGHT 120 60\r\n");
+            (void)BleUartSendString("LINE 00 RECOVER_RIGHT 120 100\r\n");
+            break;
+        case TRACE_ACTION_RIGHT_11:
+            (void)BleUartSendString("LINE 11 RIGHT_11 110 90\r\n");
             break;
         case TRACE_ACTION_HOLD_LEFT:
-            (void)BleUartSendString("LINE 11 HOLD_LEFT 60 120\r\n");
+            (void)BleUartSendString("LINE 11 HOLD_LEFT 100 120\r\n");
             break;
         case TRACE_ACTION_HOLD_RIGHT:
-            (void)BleUartSendString("LINE 11 HOLD_RIGHT 120 60\r\n");
+            (void)BleUartSendString("LINE 11 HOLD_RIGHT 120 100\r\n");
             break;
         case TRACE_ACTION_RECOVER_CENTER:
             (void)BleUartSendString("LINE 11 HOLD_CENTER 120 120\r\n");
@@ -516,6 +1246,7 @@ __attribute__((unused)) static void TraceBleDiagHeartbeat(uint32_t now)
             break;
         case TRACE_ACTION_RIGHT:
         case TRACE_ACTION_RECOVER_RIGHT:
+        case TRACE_ACTION_RIGHT_11:
         case TRACE_ACTION_HOLD_RIGHT:
             actionName = "RIGHT";
             break;
@@ -538,19 +1269,28 @@ __attribute__((unused)) static void TraceBleDiagHeartbeat(uint32_t now)
 static void TraceApplyAction(TraceAction action)
 {
     int actionChanged = (action != g_lastAction);
+    int commandChanged = actionChanged;
 
-    if (actionChanged == 0 && g_motorCommandValid != 0
+    /* A new one-second bias decision must re-send FWD even when FWD is unchanged. */
+    if (action == TRACE_ACTION_FORWARD && g_traceBiasApplied != g_traceBias) {
+        commandChanged = 1;
+    }
+
+    if (commandChanged == 0 && g_motorCommandValid != 0
 #if (REVERSE_REPLAY_STRAIGHT_TEST_MODE == 1)
         && g_replayRecordActive == 0
 #endif
        ) {
+        TraceBiasObserve(action);
         return;
     }
 
     switch (action) {
         case TRACE_ACTION_FORWARD:
-            TraceSendMotorCommand(TRACE_FORWARD_SPEED, TRACE_FORWARD_SPEED, 0);
-            if (actionChanged != 0) printf("TRACE forward L=%d R=%d\r\n", TRACE_FORWARD_SPEED, TRACE_FORWARD_SPEED);
+            TraceSendMotorCommand(g_traceBias == TRACE_BIAS_LEFT ? 99 : g_traceBias == TRACE_BIAS_RIGHT ? 101 : TRACE_FORWARD_SPEED,
+                                  g_traceBias == TRACE_BIAS_LEFT ? 101 : g_traceBias == TRACE_BIAS_RIGHT ? 99 : TRACE_FORWARD_SPEED, 0);
+            g_traceBiasApplied = g_traceBias;
+            if (actionChanged != 0) printf("TRACE forward bias=%s\r\n", g_lineLiveBias);
             break;
         case TRACE_ACTION_LEFT:
             TraceSendMotorCommand(TRACE_INNER_SPEED, TRACE_OUTER_SPEED, 0);
@@ -568,6 +1308,10 @@ static void TraceApplyAction(TraceAction action)
             TraceSendMotorCommand(TRACE_OUTER_SPEED, TRACE_INNER_SPEED, 0);
             if (actionChanged != 0) printf("TRACE recover-right L=%d R=%d\r\n", TRACE_OUTER_SPEED, TRACE_INNER_SPEED);
             break;
+        case TRACE_ACTION_RIGHT_11:
+            TraceSendMotorCommand(TRACE_OUTER_SPEED, TRACE_INNER_SPEED, 0);
+            if (actionChanged != 0) printf("TRACE right-11 L=%d R=%d\r\n", TRACE_OUTER_SPEED, TRACE_INNER_SPEED);
+            break;
         case TRACE_ACTION_HOLD_LEFT:
             TraceSendMotorCommand(TRACE_INNER_SPEED, TRACE_OUTER_SPEED, 0);
             if (actionChanged != 0) printf("TRACE hold-left L=%d R=%d\r\n", TRACE_INNER_SPEED, TRACE_OUTER_SPEED);
@@ -575,6 +1319,14 @@ static void TraceApplyAction(TraceAction action)
         case TRACE_ACTION_HOLD_RIGHT:
             TraceSendMotorCommand(TRACE_OUTER_SPEED, TRACE_INNER_SPEED, 0);
             if (actionChanged != 0) printf("TRACE hold-right L=%d R=%d\r\n", TRACE_OUTER_SPEED, TRACE_INNER_SPEED);
+            break;
+        case TRACE_ACTION_COUNTER_LEFT:
+            TraceSendMotorCommand(TRACE_INNER_SPEED, TRACE_OUTER_SPEED, 0);
+            if (actionChanged != 0) printf("TRACE counter-left L=%d R=%d\r\n", TRACE_INNER_SPEED, TRACE_OUTER_SPEED);
+            break;
+        case TRACE_ACTION_COUNTER_RIGHT:
+            TraceSendMotorCommand(TRACE_OUTER_SPEED, TRACE_INNER_SPEED, 0);
+            if (actionChanged != 0) printf("TRACE counter-right L=%d R=%d\r\n", TRACE_OUTER_SPEED, TRACE_INNER_SPEED);
             break;
         case TRACE_ACTION_RECOVER_CENTER:
             TraceSendMotorCommand(TRACE_RECOVER_SPEED, TRACE_RECOVER_SPEED, 0);
@@ -587,10 +1339,237 @@ static void TraceApplyAction(TraceAction action)
     }
 
     g_lastAction = action;
+    TraceBiasObserve(action);
     if (actionChanged != 0) {
         TraceBleDiagAction(action);
     }
 }
+
+#if (ENCODER_BPATH_FOLLOW_V1_TEST_MODE == 1) && (LINE_SENSOR_SIDE_TEST_MODE == 0)
+static const char *TraceRecordDiagActionName(TraceAction action)
+{
+    switch (action) {
+        case TRACE_ACTION_FORWARD: return "FWD";
+        case TRACE_ACTION_LEFT: return "LEFT";
+        case TRACE_ACTION_RIGHT: return "RIGHT";
+        case TRACE_ACTION_RECOVER_LEFT: return "LEFT_MIN";
+        case TRACE_ACTION_RECOVER_RIGHT: return "RIGHT_MIN";
+        case TRACE_ACTION_RIGHT_11: return "RIGHT_11";
+        case TRACE_ACTION_HOLD_LEFT: return "HOLD_L";
+        case TRACE_ACTION_HOLD_RIGHT: return "HOLD_R";
+        case TRACE_ACTION_COUNTER_LEFT: return "COUNTER_LEFT";
+        case TRACE_ACTION_COUNTER_RIGHT: return "COUNTER_RIGHT";
+        case TRACE_ACTION_RECOVER_CENTER: return "REC_C";
+        default: return "STOP";
+    }
+}
+
+static const char *TraceRecordDiagCorrectionName(TraceCorrection correction)
+{
+    if (correction == TRACE_CORRECTION_LEFT) return "LEFT";
+    if (correction == TRACE_CORRECTION_RIGHT) return "RIGHT";
+    return "NONE";
+}
+
+static void TraceRecordDiagPublish(int rawLeft, int rawRight, uint32_t now)
+{
+    char text[180];
+    int startEvent = (g_traceRecordDiagStartPending != 0U);
+
+    if (startEvent == 0 &&
+        (uint32_t)(now - g_traceRecordDiagLastTick) <
+        AppMsToTicks(TRACE_RECORD_DIAG_PERIOD_MS)) {
+        return;
+    }
+    (void)snprintf(text, sizeof(text),
+        "TRACE_DIAG%s profile=GOLDEN_RESTORE_V1 raw_l=%d raw_r=%d stable_l=%u stable_r=%u action=%s cmd_l=%d cmd_r=%d last_corr=%s",
+        startEvent != 0 ? " event=START" : "",
+        rawLeft, rawRight,
+        (unsigned int)((g_stableState >> 1) & 0x01U),
+        (unsigned int)(g_stableState & 0x01U),
+        TraceRecordDiagActionName(g_lastAction),
+        g_motorLeftCommand, g_motorRightCommand,
+        TraceRecordDiagCorrectionName(g_lastCorrection));
+    (void)UdpTelemetryQueueExperimentText(text);
+    g_traceRecordDiagStartPending = 0U;
+    g_traceRecordDiagLastTick = now;
+}
+
+typedef struct {
+    uint8_t active;
+    TraceCorrection direction;
+    uint32_t startTick;
+    uint32_t lastTick;
+    uint32_t rawMs[4];
+    uint32_t stableMs[4];
+} TraceCurveSegment;
+
+static TraceCurveSegment g_traceCurveSegment;
+
+static void TraceCurveStateText(uint8_t state, char text[3])
+{
+    text[0] = (state & 0x02U) != 0U ? '1' : '0';
+    text[1] = (state & 0x01U) != 0U ? '1' : '0';
+    text[2] = '\0';
+}
+
+static TraceCorrection TraceCurveActionDirection(TraceAction action)
+{
+    if (action == TRACE_ACTION_LEFT || action == TRACE_ACTION_RECOVER_LEFT) {
+        return TRACE_CORRECTION_LEFT;
+    }
+    if (action == TRACE_ACTION_RIGHT || action == TRACE_ACTION_RECOVER_RIGHT ||
+        action == TRACE_ACTION_RIGHT_11) {
+        return TRACE_CORRECTION_RIGHT;
+    }
+    return TRACE_CORRECTION_NONE;
+}
+
+static void TraceCurveAccumulate(uint32_t now, uint8_t rawState, uint8_t stableState)
+{
+    uint32_t elapsed;
+
+    if (g_traceCurveSegment.active == 0U) {
+        return;
+    }
+    elapsed = AppTicksToMs(now - g_traceCurveSegment.lastTick);
+    if (rawState < 4U) {
+        g_traceCurveSegment.rawMs[rawState] += elapsed;
+    }
+    if (stableState < 4U) {
+        g_traceCurveSegment.stableMs[stableState] += elapsed;
+    }
+    g_traceCurveSegment.lastTick = now;
+}
+
+static void TraceCurveReset(void)
+{
+    uint8_t index;
+
+    g_traceCurveSegment.active = 0U;
+    g_traceCurveSegment.direction = TRACE_CORRECTION_NONE;
+    g_traceCurveSegment.startTick = 0U;
+    g_traceCurveSegment.lastTick = 0U;
+    for (index = 0U; index < 4U; index++) {
+        g_traceCurveSegment.rawMs[index] = 0U;
+        g_traceCurveSegment.stableMs[index] = 0U;
+    }
+}
+
+static void TraceCurveStart(uint32_t now, TraceCorrection direction)
+{
+    char text[128];
+
+    TraceCurveReset();
+    g_traceCurveSegment.active = 1U;
+    g_traceCurveSegment.direction = direction;
+    g_traceCurveSegment.startTick = now;
+    g_traceCurveSegment.lastTick = now;
+    (void)snprintf(text, sizeof(text),
+        "TRACE_CURVE_EVENT event=CORR_START dir=%s ms=%u",
+        TraceRecordDiagCorrectionName(direction), (unsigned int)AppTicksToMs(now));
+    (void)UdpTelemetryQueueExperimentText(text);
+}
+
+static void TraceCurveEnd(uint32_t now, const char *reason)
+{
+    char eventText[192];
+    char segmentText[256];
+    char rawText[3];
+    char stableText[3];
+    uint8_t rawState;
+    uint8_t stableState;
+    uint32_t duration;
+
+    if (g_traceCurveSegment.active == 0U) {
+        return;
+    }
+    rawState = (uint8_t)((g_lineLiveRawLeft << 1) | g_lineLiveRawRight);
+    stableState = g_stableStateValid != 0 ? g_stableState : rawState;
+    TraceCurveAccumulate(now, rawState, stableState);
+    duration = AppTicksToMs(now - g_traceCurveSegment.startTick);
+    TraceCurveStateText(rawState, rawText);
+    TraceCurveStateText(stableState, stableText);
+    (void)snprintf(eventText, sizeof(eventText),
+        "TRACE_CURVE_EVENT event=CORR_END dir=%s duration_ms=%u end_raw=%s end_stable=%s reason=%s",
+        TraceRecordDiagCorrectionName(g_traceCurveSegment.direction),
+        (unsigned int)duration, rawText, stableText, reason);
+    (void)UdpTelemetryQueueExperimentText(eventText);
+    (void)snprintf(segmentText, sizeof(segmentText),
+        "TRACE_CURVE_SEGMENT dir=%s duration_ms=%u raw00_ms=%u raw10_ms=%u raw01_ms=%u raw11_ms=%u stable00_ms=%u stable10_ms=%u stable01_ms=%u stable11_ms=%u end_reason=%s",
+        TraceRecordDiagCorrectionName(g_traceCurveSegment.direction), (unsigned int)duration,
+        (unsigned int)g_traceCurveSegment.rawMs[0], (unsigned int)g_traceCurveSegment.rawMs[2],
+        (unsigned int)g_traceCurveSegment.rawMs[1], (unsigned int)g_traceCurveSegment.rawMs[3],
+        (unsigned int)g_traceCurveSegment.stableMs[0], (unsigned int)g_traceCurveSegment.stableMs[2],
+        (unsigned int)g_traceCurveSegment.stableMs[1], (unsigned int)g_traceCurveSegment.stableMs[3], reason);
+    (void)UdpTelemetryQueueExperimentText(segmentText);
+    TraceCurveReset();
+}
+
+static void TraceCurveObserve(uint32_t now, WifiIotGpioValue rawLeft,
+                              WifiIotGpioValue rawRight)
+{
+    char text[224];
+    char rawText[3];
+    char stableText[3];
+    const char *reason = NULL;
+    uint8_t rawState = (uint8_t)((rawLeft == WIFI_IOT_GPIO_VALUE1 ? 2U : 0U) |
+                                 (rawRight == WIFI_IOT_GPIO_VALUE1 ? 1U : 0U));
+    uint8_t stableState = g_stableStateValid != 0 ? g_stableState : rawState;
+    TraceCorrection direction = TraceCurveActionDirection(g_lastAction);
+    uint32_t correctionMs = g_activeCorrectionDirection == TRACE_CORRECTION_NONE ? 0U :
+        AppTicksToMs(now - g_activeCorrectionStartTick);
+
+    if (g_traceCurveSegment.active != 0U) {
+        TraceCurveAccumulate(now, rawState, stableState);
+        if (direction == TRACE_CORRECTION_NONE) {
+            reason = (g_lastAction == TRACE_ACTION_COUNTER_LEFT ||
+                      g_lastAction == TRACE_ACTION_COUNTER_RIGHT) ? "COUNTER_11" : "FWD_00";
+        } else if (direction != g_traceCurveSegment.direction) {
+            reason = "OPPOSITE_RAW";
+        }
+        if (reason != NULL) {
+            TraceCurveEnd(now, reason);
+        }
+    }
+    if (direction != TRACE_CORRECTION_NONE && g_traceCurveSegment.active == 0U) {
+        TraceCurveStart(now, direction);
+    }
+    TraceCurveStateText(rawState, rawText);
+    TraceCurveStateText(stableState, stableText);
+    (void)snprintf(text, sizeof(text),
+        "TRACE_CURVE ms=%u raw=%s stable=%s action=%s cmd_l=%d cmd_r=%d corr_dir=%s corr_ms=%u bias=%s last_corr=%s",
+        (unsigned int)AppTicksToMs(now), rawText, stableText,
+        TraceRecordDiagActionName(g_lastAction), g_motorLeftCommand, g_motorRightCommand,
+        TraceRecordDiagCorrectionName(g_activeCorrectionDirection), (unsigned int)correctionMs,
+        g_lineLiveBias, TraceRecordDiagCorrectionName(g_lastCorrection));
+    (void)UdpTelemetryQueueExperimentText(text);
+}
+#endif
+
+#if (TRACE_OPEN_LOOP_STRAIGHT_TEST_MODE == 1)
+static uint32_t g_traceOpenLoopLastTick;
+
+/* Outer diagnostic override for BPATH TRACE_RECORD only: sensor sampling and
+ * debounce remain active, but the final forward command is fixed at 100/100. */
+static void TraceOpenLoopStraightStep(int rawLeft, int rawRight, uint32_t now)
+{
+    char text[160];
+
+    TraceApplyAction(TRACE_ACTION_FORWARD);
+    if ((uint32_t)(now - g_traceOpenLoopLastTick) < AppMsToTicks(100U)) {
+        return;
+    }
+    (void)snprintf(text, sizeof(text),
+        "TRACE_OPENLOOP ms=%u raw_l=%d raw_r=%d state=%u%u cmd_l=100 cmd_r=100",
+        (unsigned int)((uint64_t)now * 1000U / osKernelGetTickFreq()),
+        rawLeft, rawRight,
+        (unsigned int)((g_stableState >> 1) & 0x01U),
+        (unsigned int)(g_stableState & 0x01U));
+    (void)UdpTelemetryQueueExperimentText(text);
+    g_traceOpenLoopLastTick = now;
+}
+#endif
 
 static void TraceResetDebounce(void)
 {
@@ -598,6 +1577,30 @@ static void TraceResetDebounce(void)
     g_candidateState = 0U;
     g_candidateSamples = 0U;
     g_stableStateValid = 0;
+    TraceResetState11Counter();
+    g_activeCorrectionDirection = TRACE_CORRECTION_NONE;
+    LineLiveSetCorrection("NONE", 0U);
+}
+
+static void TraceResetState11Counter(void)
+{
+    g_state11CounterActive = 0U;
+    g_state11CounterDirection = TRACE_CORRECTION_NONE;
+}
+
+static void TraceSetActiveCorrection(TraceCorrection direction, uint32_t now)
+{
+    if (g_activeCorrectionDirection != direction) {
+        g_activeCorrectionDirection = direction;
+        g_activeCorrectionStartTick = now;
+        LineLiveSetCorrection(direction == TRACE_CORRECTION_LEFT ? "LEFT" : "RIGHT", now);
+    }
+}
+
+static void TraceClearActiveCorrection(void)
+{
+    g_activeCorrectionDirection = TRACE_CORRECTION_NONE;
+    LineLiveSetCorrection("NONE", 0U);
 }
 
 static void TraceResetRecovery(void)
@@ -638,23 +1641,266 @@ static int TraceUpdateStableState(WifiIotGpioValue left, WifiIotGpioValue right)
     return 0;
 }
 
+#if (TRACE_STEP_RESPONSE_TEST_MODE == 1)
+static const char *TraceStepResponseDirectionName(TraceStepResponseCommand command)
+{
+    if (command == TRACE_STEP_RESPONSE_COMMAND_LEFT_100 ||
+        command == TRACE_STEP_RESPONSE_COMMAND_LEFT_200 ||
+        command == TRACE_STEP_RESPONSE_COMMAND_LEFT_300) {
+        return "LEFT";
+    }
+    return "RIGHT";
+}
+
+static uint32_t TraceStepResponseDurationMs(TraceStepResponseCommand command)
+{
+    if (command == TRACE_STEP_RESPONSE_COMMAND_LEFT_100 ||
+        command == TRACE_STEP_RESPONSE_COMMAND_RIGHT_100) return 100U;
+    if (command == TRACE_STEP_RESPONSE_COMMAND_LEFT_200 ||
+        command == TRACE_STEP_RESPONSE_COMMAND_RIGHT_200) return 200U;
+    return 300U;
+}
+
+static uint8_t TraceStepResponseRequiredState(TraceStepResponseCommand command)
+{
+    return (TraceStepResponseDirectionName(command)[0] == 'L') ? 0x02U : 0x01U;
+}
+
+static void TraceStepResponseCommands(TraceStepResponseCommand command,
+                                      int *leftCommand, int *rightCommand)
+{
+    if (TraceStepResponseDirectionName(command)[0] == 'L') {
+        *leftCommand = TRACE_INNER_SPEED;
+        *rightCommand = TRACE_OUTER_SPEED;
+    } else {
+        *leftCommand = TRACE_OUTER_SPEED;
+        *rightCommand = TRACE_INNER_SPEED;
+    }
+}
+
+static void TraceStepResponsePublishSample(const char *event, uint32_t elapsedMs,
+                                            const char *direction, int rawLeft, int rawRight,
+                                            int leftCommand, int rightCommand)
+{
+    char text[224];
+
+    (void)snprintf(text, sizeof(text),
+        "%s elapsed_ms=%u direction=%s raw_l=%d raw_r=%d stable_l=%u stable_r=%u state=%u%u cmd_l=%d cmd_r=%d",
+        event, (unsigned int)elapsedMs, direction, rawLeft, rawRight,
+        (unsigned int)((g_stableState >> 1) & 0x01U),
+        (unsigned int)(g_stableState & 0x01U),
+        (unsigned int)((g_stableState >> 1) & 0x01U),
+        (unsigned int)(g_stableState & 0x01U), leftCommand, rightCommand);
+    (void)UdpTelemetryQueueExperimentText(text);
+}
+
+static void TraceStepResponsePublishCoast(uint32_t elapsedMs, const char *direction,
+                                          int rawLeft, int rawRight)
+{
+    char text[224];
+
+    (void)snprintf(text, sizeof(text),
+        "TRACE_STEP_COAST elapsed_ms=%u direction=%s raw_l=%d raw_r=%d stable_l=%u stable_r=%u state=%u%u motor_l=0 motor_r=0",
+        (unsigned int)elapsedMs, direction, rawLeft, rawRight,
+        (unsigned int)((g_stableState >> 1) & 0x01U),
+        (unsigned int)(g_stableState & 0x01U),
+        (unsigned int)((g_stableState >> 1) & 0x01U),
+        (unsigned int)(g_stableState & 0x01U));
+    (void)UdpTelemetryQueueExperimentText(text);
+}
+
+static void TraceStepResponseStep(uint32_t now, int sensorValid,
+                                  WifiIotGpioValue rawLeft, WifiIotGpioValue rawRight,
+                                  int *leftCommand, int *rightCommand)
+{
+    TraceStepResponseCommand command = g_traceStepResponsePendingCommand;
+    uint32_t elapsedMs;
+
+    *leftCommand = 0;
+    *rightCommand = 0;
+    g_traceStepResponsePendingCommand = TRACE_STEP_RESPONSE_COMMAND_NONE;
+
+    if (sensorValid != 0) {
+        (void)TraceUpdateStableState(rawLeft, rawRight);
+    } else {
+        TraceResetDebounce();
+    }
+
+    if (command == TRACE_STEP_RESPONSE_COMMAND_STOP) {
+        g_traceStepResponseState = TRACE_STEP_RESPONSE_IDLE;
+        g_traceStepResponseActiveCommand = TRACE_STEP_RESPONSE_COMMAND_NONE;
+        (void)UdpTelemetryQueueExperimentText("TRACE_STEP event=STOP state=IDLE");
+        return;
+    }
+
+    if (g_traceStepResponseState == TRACE_STEP_RESPONSE_IDLE) {
+        if (command == TRACE_STEP_RESPONSE_COMMAND_NONE) {
+            return;
+        }
+        if (sensorValid == 0 || g_stableStateValid == 0 ||
+            g_stableState != TraceStepResponseRequiredState(command)) {
+            char text[152];
+
+            (void)snprintf(text, sizeof(text),
+                "TRACE_STEP event=REJECT direction=%s duration_ms=%u state=%u%u reason=NEED_%s",
+                TraceStepResponseDirectionName(command),
+                (unsigned int)TraceStepResponseDurationMs(command),
+                (unsigned int)((g_stableState >> 1) & 0x01U),
+                (unsigned int)(g_stableState & 0x01U),
+                TraceStepResponseDirectionName(command)[0] == 'L' ? "10" : "01");
+            (void)UdpTelemetryQueueExperimentText(text);
+            return;
+        }
+        g_traceStepResponseState = TRACE_STEP_RESPONSE_PULSE;
+        g_traceStepResponseActiveCommand = command;
+        g_traceStepResponseStartTick = now;
+        TraceStepResponseCommands(command, leftCommand, rightCommand);
+        {
+            char text[176];
+
+            (void)snprintf(text, sizeof(text),
+                "TRACE_STEP event=BEGIN direction=%s duration_ms=%u pre_state=%u%u cmd_l=%d cmd_r=%d",
+                TraceStepResponseDirectionName(command),
+                (unsigned int)TraceStepResponseDurationMs(command),
+                (unsigned int)((g_stableState >> 1) & 0x01U),
+                (unsigned int)(g_stableState & 0x01U), *leftCommand, *rightCommand);
+            (void)UdpTelemetryQueueExperimentText(text);
+        }
+        TraceStepResponsePublishSample("TRACE_STEP_SAMPLE", 0U,
+                                       TraceStepResponseDirectionName(command),
+                                       (int)rawLeft, (int)rawRight,
+                                       *leftCommand, *rightCommand);
+        return;
+    }
+
+    elapsedMs = AppTicksToMs(now - g_traceStepResponseStartTick);
+    if (g_traceStepResponseState == TRACE_STEP_RESPONSE_PULSE) {
+        if (elapsedMs >= TraceStepResponseDurationMs(g_traceStepResponseActiveCommand)) {
+            char text[160];
+
+            g_traceStepResponseState = TRACE_STEP_RESPONSE_COAST;
+            g_traceStepResponseStartTick = now;
+            (void)snprintf(text, sizeof(text),
+                "TRACE_STEP event=PULSE_END direction=%s duration_ms=%u state=%u%u",
+                TraceStepResponseDirectionName(g_traceStepResponseActiveCommand),
+                (unsigned int)TraceStepResponseDurationMs(g_traceStepResponseActiveCommand),
+                (unsigned int)((g_stableState >> 1) & 0x01U),
+                (unsigned int)(g_stableState & 0x01U));
+            (void)UdpTelemetryQueueExperimentText(text);
+            TraceStepResponsePublishCoast(0U,
+                                          TraceStepResponseDirectionName(g_traceStepResponseActiveCommand),
+                                          (int)rawLeft, (int)rawRight);
+            return;
+        }
+        TraceStepResponseCommands(g_traceStepResponseActiveCommand, leftCommand, rightCommand);
+        TraceStepResponsePublishSample("TRACE_STEP_SAMPLE", elapsedMs,
+                                       TraceStepResponseDirectionName(g_traceStepResponseActiveCommand),
+                                       (int)rawLeft, (int)rawRight,
+                                       *leftCommand, *rightCommand);
+        return;
+    }
+
+    if (elapsedMs >= TRACE_STEP_RESPONSE_COAST_MS) {
+        char text[160];
+
+        (void)snprintf(text, sizeof(text),
+            "TRACE_STEP event=END direction=%s duration_ms=%u final_state=%u%u",
+            TraceStepResponseDirectionName(g_traceStepResponseActiveCommand),
+            (unsigned int)TraceStepResponseDurationMs(g_traceStepResponseActiveCommand),
+            (unsigned int)((g_stableState >> 1) & 0x01U),
+            (unsigned int)(g_stableState & 0x01U));
+        (void)UdpTelemetryQueueExperimentText(text);
+        g_traceStepResponseState = TRACE_STEP_RESPONSE_IDLE;
+        g_traceStepResponseActiveCommand = TRACE_STEP_RESPONSE_COMMAND_NONE;
+        return;
+    }
+    TraceStepResponsePublishCoast(elapsedMs,
+                                  TraceStepResponseDirectionName(g_traceStepResponseActiveCommand),
+                                  (int)rawLeft, (int)rawRight);
+}
+#endif
+
 #if (TRACE_REVERSE_TEST_MODE == 0) && (TRACE_REVERSE_V2_TEST_MODE == 0) && \
     (TRACE_REVERSE_V3_TEST_MODE == 0) && (TRACE_REVERSE_V4_TEST_MODE == 0)
 __attribute__((unused)) static void TraceControlStep(WifiIotGpioValue left, WifiIotGpioValue right, uint32_t now)
 {
-    if (left == WIFI_IOT_GPIO_VALUE1 && right == WIFI_IOT_GPIO_VALUE1) {
+    uint8_t rawState = (uint8_t)((left == WIFI_IOT_GPIO_VALUE1 ? 2U : 0U) |
+                                 (right == WIFI_IOT_GPIO_VALUE1 ? 1U : 0U));
+    uint32_t correctionElapsed = g_activeCorrectionDirection == TRACE_CORRECTION_NONE ?
+        0U : AppTicksToMs(now - g_activeCorrectionStartTick);
+
+    /* Fast-entry is intentionally raw and asymmetric: directional evidence
+     * starts a physical correction immediately; stable debounce remains intact. */
+    if (rawState == 0x02U) {
         TraceResetRecovery();
-        if (g_lastCorrection == TRACE_CORRECTION_LEFT) {
-            TraceApplyAction(TRACE_ACTION_HOLD_LEFT);
-        } else if (g_lastCorrection == TRACE_CORRECTION_RIGHT) {
-            TraceApplyAction(TRACE_ACTION_HOLD_RIGHT);
+        TraceResetState11Counter();
+        TraceSetActiveCorrection(TRACE_CORRECTION_LEFT, now);
+        g_lastCorrection = TRACE_CORRECTION_LEFT;
+        TraceApplyAction(TRACE_ACTION_LEFT);
+        return;
+    }
+    if (rawState == 0x01U) {
+        TraceResetRecovery();
+        TraceResetState11Counter();
+        TraceSetActiveCorrection(TRACE_CORRECTION_RIGHT, now);
+        g_lastCorrection = TRACE_CORRECTION_RIGHT;
+        TraceApplyAction(TRACE_ACTION_RIGHT);
+        return;
+    }
+
+    /* A correction must move the chassis before 00/11 may cancel or counter it. */
+    if (g_activeCorrectionDirection != TRACE_CORRECTION_NONE &&
+        correctionElapsed < TRACE_CORRECTION_MIN_HOLD_MS) {
+        if (g_activeCorrectionDirection == TRACE_CORRECTION_LEFT) {
+            TraceApplyAction(TRACE_ACTION_RECOVER_LEFT);
         } else {
-            TraceApplyAction(TRACE_ACTION_RECOVER_CENTER);
+            TraceApplyAction(TRACE_ACTION_RECOVER_RIGHT);
         }
         return;
     }
 
-    if (left == WIFI_IOT_GPIO_VALUE0 && right == WIFI_IOT_GPIO_VALUE0) {
+    if (g_stableState == 0x03U) {
+        /* Right-curve forensics show stable 11 is the dominant in-curve
+         * observation on the failed RIGHT mirror. Keep physical RIGHT until
+         * clear 00 or raw 10 proves the opposite direction. LEFT keeps its
+         * existing 11 counter-steer behavior for this one-sided experiment. */
+        if (g_activeCorrectionDirection == TRACE_CORRECTION_RIGHT) {
+            TraceResetRecovery();
+            TraceResetState11Counter();
+            TraceApplyAction(TRACE_ACTION_RIGHT_11);
+            return;
+        }
+        /* In this manual-return debug profile, 11 is not a line marker and
+         * does not hold the old turn. Entering 11 latches the opposite of
+         * the preceding normal correction once, preventing 30 ms flip-flop. */
+        TraceResetRecovery();
+        if (g_state11CounterActive == 0U) {
+            g_state11CounterActive = 1U;
+            if (g_lastCorrection == TRACE_CORRECTION_LEFT) {
+                g_state11CounterDirection = TRACE_CORRECTION_RIGHT;
+            } else if (g_lastCorrection == TRACE_CORRECTION_RIGHT) {
+                g_state11CounterDirection = TRACE_CORRECTION_LEFT;
+            } else {
+                g_state11CounterDirection = TRACE_CORRECTION_NONE;
+            }
+        }
+        if (g_state11CounterDirection == TRACE_CORRECTION_LEFT) {
+            TraceSetActiveCorrection(TRACE_CORRECTION_LEFT, now);
+            TraceApplyAction(TRACE_ACTION_COUNTER_LEFT);
+        } else if (g_state11CounterDirection == TRACE_CORRECTION_RIGHT) {
+            TraceSetActiveCorrection(TRACE_CORRECTION_RIGHT, now);
+            TraceApplyAction(TRACE_ACTION_COUNTER_RIGHT);
+        } else {
+            TraceClearActiveCorrection();
+            TraceApplyAction(TRACE_ACTION_FORWARD);
+        }
+        return;
+    }
+
+    TraceResetState11Counter();
+
+    if (g_stableState == 0x00U) {
+        TraceClearActiveCorrection();
         if (g_recoveryActive == 0 &&
             (g_lastAction == TRACE_ACTION_LEFT ||
              g_lastAction == TRACE_ACTION_RIGHT ||
@@ -679,12 +1925,14 @@ __attribute__((unused)) static void TraceControlStep(WifiIotGpioValue left, Wifi
             TraceResetRecovery();
             TraceApplyAction(TRACE_ACTION_FORWARD);
         }
-    } else if (left == WIFI_IOT_GPIO_VALUE1 && right == WIFI_IOT_GPIO_VALUE0) {
+    } else if (g_stableState == 0x02U) {
         TraceResetRecovery();
+        TraceSetActiveCorrection(TRACE_CORRECTION_LEFT, now);
         g_lastCorrection = TRACE_CORRECTION_LEFT;
         TraceApplyAction(TRACE_ACTION_LEFT);
-    } else if (left == WIFI_IOT_GPIO_VALUE0 && right == WIFI_IOT_GPIO_VALUE1) {
+    } else if (g_stableState == 0x01U) {
         TraceResetRecovery();
+        TraceSetActiveCorrection(TRACE_CORRECTION_RIGHT, now);
         g_lastCorrection = TRACE_CORRECTION_RIGHT;
         TraceApplyAction(TRACE_ACTION_RIGHT);
     } else {
@@ -4135,17 +5383,25 @@ static void CarControlTask(void *argument)
     WifiIotGpioValue right = WIFI_IOT_GPIO_VALUE0;
 
     (void)argument;
-    printf("LINE SENSOR SIDE TEST START\r\n");
+    printf("TRACE SENSOR SIDE TEST START: motor forced 0/0\r\n");
 
     for (;;) {
+        uint32_t now = osKernelGetTickCount();
+
+        /* This owner-loop test intentionally wins over every motion workflow. */
+        TraceStaticTestForceStop();
         if (LineSensorRead(&left, &right) == 1) {
-            /* LineSensorRead returns physical left GPIO13 and right GPIO14. */
-            printf("LINE RAW GPIO13=%d GPIO14=%d\r\n",
-                   (int)left, (int)right);
-            printf("LINE NAMED L=%d R=%d\r\n",
-                   (int)left, (int)right);
+            char text[160];
+
+            /* Raw, unfiltered mapping: GPIO13 is TRACE left; GPIO14 is TRACE right. */
+            (void)snprintf(text, sizeof(text),
+                "TRACE_SIDE ms=%u gpio13=%d gpio14=%d trace_left=%d trace_right=%d motor_l=0 motor_r=0",
+                (unsigned int)((uint64_t)now * 1000U / osKernelGetTickFreq()),
+                (int)left, (int)right, (int)left, (int)right);
+            (void)UdpTelemetryQueueExperimentText(text);
         } else {
-            printf("LINE SENSOR READ FAILED\r\n");
+            (void)UdpTelemetryQueueExperimentText(
+                "TRACE_SIDE event=READ_FAIL motor_l=0 motor_r=0");
         }
 
         osDelay(AppMsToTicks(CAR_LINE_CALIBRATION_PERIOD_MS));
@@ -4193,8 +5449,17 @@ static void CarControlTask(void *argument)
 #if (ENCODER_SEGMENT_B_PROGRESS_TEST_MODE == 1)
     BProgressInit();
 #endif
-#if (ENCODER_BPATH_FOLLOW_V1_TEST_MODE == 1)
+#if (ENCODER_BPATH_FOLLOW_V1_TEST_MODE == 1) && (MOTOR_RESPONSE_TEST_MODE == 0) && \
+    (LINE_SENSOR_SIDE_TEST_MODE == 0)
+    BpathControlPublish("BPATHCTL event=READY state=DISARMED");
+#if (AUTO_TRACE_BOOT_TEST_MODE == 1)
+    BpathControlBeginRun(1U);
+#else
     BPathFollowInit();
+#endif
+#endif
+#if (MOTOR_RESPONSE_TEST_MODE == 1)
+    MotorResponseInit();
 #endif
 
     /* One stop frame at startup; no repeated stop traffic while idle. */
@@ -4232,14 +5497,213 @@ static void CarControlTask(void *argument)
     for (;;) {
         CarMode mode = CarControlGetMode();
         uint32_t now = osKernelGetTickCount();
+        WifiIotGpioValue lineLiveRawLeft = WIFI_IOT_GPIO_VALUE0;
+        WifiIotGpioValue lineLiveRawRight = WIFI_IOT_GPIO_VALUE0;
+        int lineLiveSensorValid = LineSensorRead(&lineLiveRawLeft, &lineLiveRawRight);
+
+        /* One fresh owner-loop read drives the independent, always-on view. */
+        LineLiveUpdateSensor(lineLiveRawLeft, lineLiveRawRight, lineLiveSensorValid);
+        LineLivePublish(now);
+#if (TRACE_OBSERVER_TEST_MODE == 1) && (ENCODER_BPATH_FOLLOW_V1_TEST_MODE == 1) && \
+    (LINE_SENSOR_SIDE_TEST_MODE == 0)
+        {
+            int observerWasActive = g_traceObserverActive;
+
+            TraceObserverConsumeCommand();
+            if (g_traceObserverActive != 0) {
+                WifiIotGpioValue observerRawLeft = WIFI_IOT_GPIO_VALUE0;
+                WifiIotGpioValue observerRawRight = WIFI_IOT_GPIO_VALUE0;
+
+                if (g_bpathPendingCommand != BPATH_CONTROL_COMMAND_NONE) {
+                    TraceObserverStop("BPATH_COMMAND");
+                } else if (mode != CAR_MODE_TRACE) {
+                    TraceObserverStop("MODE_CHANGE");
+                    CarControlSetMode(CAR_MODE_IDLE);
+                } else if (LineSensorRead(&observerRawLeft, &observerRawRight) != 1) {
+                    TraceObserverStop("SENSOR_READ_FAIL");
+                } else {
+                    /* Pure observer: this function only reads sensor state and queues text. */
+                    TraceObserverStep(now, observerRawLeft, observerRawRight);
+                }
+                /* TaskCarControl is the only motor owner; observer never owns a motor API. */
+                EncoderExperimentSendMotorCommand(0, 0, now);
+                osDelay(AppMsToTicks(CAR_CONTROL_PERIOD_MS));
+                continue;
+            }
+            if (observerWasActive != 0) {
+                EncoderExperimentSendMotorCommand(0, 0, now);
+                osDelay(AppMsToTicks(CAR_CONTROL_PERIOD_MS));
+                continue;
+            }
+        }
+#endif
+#if (TRACE_STEP_RESPONSE_TEST_MODE == 1)
+        {
+            WifiIotGpioValue stepRawLeft = WIFI_IOT_GPIO_VALUE0;
+            WifiIotGpioValue stepRawRight = WIFI_IOT_GPIO_VALUE0;
+            int stepLeft = 0;
+            int stepRight = 0;
+            int stepSensorValid = LineSensorRead(&stepRawLeft, &stepRawRight);
+
+            /* This attended diagnostic owns every motor command while enabled. */
+            TraceStepResponseStep(now, stepSensorValid, stepRawLeft, stepRawRight,
+                                  &stepLeft, &stepRight);
+            EncoderExperimentSendMotorCommand(stepLeft, stepRight, now);
+            osDelay(AppMsToTicks(CAR_CONTROL_PERIOD_MS));
+            continue;
+        }
+#endif
+#if (TRACE_TRACK_GEOMETRY_TEST_MODE == 1)
+        {
+            WifiIotGpioValue geometryLeft = WIFI_IOT_GPIO_VALUE0;
+            WifiIotGpioValue geometryRight = WIFI_IOT_GPIO_VALUE0;
+
+            /* This owner-loop test wins over TRACE, BPATH, AVOID, and all motor tests. */
+            TraceStaticTestForceStop();
+            if (LineSensorRead(&geometryLeft, &geometryRight) == 1) {
+                char text[176];
+
+                /* Raw, unfiltered TRACE mapping: GPIO13/left and GPIO14/right. */
+                (void)snprintf(text, sizeof(text),
+                    "TRACE_GEOM ms=%u gpio13=%d gpio14=%d left=%d right=%d state=%d%d motor_l=0 motor_r=0",
+                    (unsigned int)((uint64_t)now * 1000U / osKernelGetTickFreq()),
+                    (int)geometryLeft, (int)geometryRight,
+                    (int)geometryLeft, (int)geometryRight,
+                    (int)geometryLeft, (int)geometryRight);
+                (void)UdpTelemetryQueueExperimentText(text);
+            } else {
+                (void)UdpTelemetryQueueExperimentText(
+                    "TRACE_GEOM event=READ_FAIL motor_l=0 motor_r=0");
+            }
+            osDelay(AppMsToTicks(CAR_LINE_CALIBRATION_PERIOD_MS));
+            continue;
+        }
+#endif
+#if (MOTOR_TURN_DIRECTION_TEST_MODE == 1)
+        {
+            int turnLeft = 0;
+            int turnRight = 0;
+            MotorTurnDirectionCommand command = g_motorTurnDirectionPendingCommand;
+
+            g_motorTurnDirectionPendingCommand = MOTOR_TURN_DIRECTION_COMMAND_NONE;
+            MotorTurnDirectionStep(now, command, &turnLeft, &turnRight);
+            EncoderExperimentSendMotorCommand(turnLeft, turnRight, now);
+            osDelay(AppMsToTicks(CAR_CONTROL_PERIOD_MS));
+            continue;
+        }
+#endif
+#if (MOTOR_RESPONSE_TEST_MODE == 1)
+        {
+            int motorCalLeft = 0;
+            int motorCalRight = 0;
+            MotorResponseCommand command = g_motorResponsePendingCommand;
+
+            g_motorResponsePendingCommand = MOTOR_RESPONSE_COMMAND_NONE;
+            MotorResponseStep(now, command, &motorCalLeft, &motorCalRight);
+            EncoderExperimentSendMotorCommand(motorCalLeft, motorCalRight, now);
+            osDelay(AppMsToTicks(CAR_CONTROL_PERIOD_MS));
+            continue;
+        }
+#endif
+#if (ENCODER_BPATH_FOLLOW_V1_TEST_MODE == 1) && (LINE_SENSOR_SIDE_TEST_MODE == 0)
+        BpathControlConsumeCommand(now);
+        if (g_bpathControlState == BPATH_CONTROL_DISARMED ||
+            g_bpathControlState == BPATH_CONTROL_DONE) {
+            EncoderExperimentSendMotorCommand(0, 0, now);
+            if (g_bpathControlState == BPATH_CONTROL_DONE) {
+                LineLiveSetControl("DONE", "DONE", 0, 0);
+            } else {
+                LineLiveSetControl("DISARMED", "STOP", 0, 0);
+            }
+            osDelay(AppMsToTicks(CAR_CONTROL_PERIOD_MS));
+            continue;
+        }
+        if (g_bpathControlState == BPATH_CONTROL_RETURN_SETTLE) {
+            if (g_manualReturnPipelineActive == 0U) {
+                BpathControlReturnGuardBlock("RETURN_SETTLE", "RETURN_SETTLE");
+                EncoderExperimentSendMotorCommand(0, 0, now);
+                osDelay(AppMsToTicks(CAR_CONTROL_PERIOD_MS));
+                continue;
+            }
+            if (BPathExternalRecordStep(now) != 0) {
+                BpathControlAbort("RETURN_SETTLE_RECORD_FAILURE");
+            }
+            EncoderExperimentSendMotorCommand(0, 0, now);
+            LineLiveSetControl("RETURN_SETTLE", "RETURN_SETTLE", 0, 0);
+            if (g_bpathAutoBootRun != 0U) {
+                TraceLivePublish(now, "--", "RETURN", 0, 0, "RETURN",
+                                 TRACE_LIVE_RETURN_PERIOD_MS, 0);
+            }
+            if (g_bpathControlState == BPATH_CONTROL_RETURN_SETTLE &&
+                BPathExternalReturnSettleComplete(now) != 0) {
+                if (BPathExternalRecordFinish(now) != 0 ||
+                    BPathExternalReturnStart(now) != 0) {
+                    BpathControlAbort("REFERENCE_FAILURE");
+                } else {
+                    g_bpathControlState = BPATH_CONTROL_BPATH_RETURN;
+                    LineLiveSetControl("RETURN", "RETURN", 0, 0);
+                }
+            }
+            osDelay(AppMsToTicks(CAR_CONTROL_PERIOD_MS));
+            continue;
+        }
+        if (g_bpathControlState == BPATH_CONTROL_BPATH_RETURN) {
+            if (g_manualReturnPipelineActive == 0U) {
+                BpathControlReturnGuardBlock("BPATH_RETURN", "BPATH_RETURN");
+                EncoderExperimentSendMotorCommand(0, 0, now);
+                osDelay(AppMsToTicks(CAR_CONTROL_PERIOD_MS));
+                continue;
+            }
+            int returnLeft = 0;
+            int returnRight = 0;
+            uint32_t terminalDelayMs = 0U;
+
+            BPathFollowStep(now, &returnLeft, &returnRight);
+            if (BPathFollowTakeTerminalExecutionRequest(&terminalDelayMs) != 0) {
+                uint32_t waitStartUs;
+                uint32_t actualWaitUs;
+                uint32_t actualStopMs;
+                uint32_t actualStopTick;
+
+                EncoderExperimentSendMotorCommand(returnLeft, returnRight, now);
+                waitStartUs = (uint32_t)hi_get_us();
+                hi_udelay(terminalDelayMs * 1000U);
+                actualWaitUs = (uint32_t)((uint32_t)hi_get_us() - waitStartUs);
+                actualStopMs = hi_get_milli_seconds();
+                actualStopTick = osKernelGetTickCount();
+                EncoderExperimentSendMotorCommand(0, 0, actualStopTick);
+                BPathFollowNotifyTerminalStopExecuted(actualStopMs, actualWaitUs);
+                LineLiveSetControl("RETURN", "RETURN", 0, 0);
+            } else {
+                EncoderExperimentSendMotorCommand(returnLeft, returnRight, now);
+                LineLiveSetControl("RETURN", "RETURN", returnLeft, returnRight);
+            }
+            if (g_bpathAutoBootRun != 0U) {
+                TraceLivePublish(now, "--", "RETURN", returnLeft, returnRight, "RETURN",
+                                 TRACE_LIVE_RETURN_PERIOD_MS, 0);
+            }
+            if (BPathFollowIsFinished() != 0) {
+                BpathControlFinish();
+                if (g_bpathAutoBootRun != 0U) {
+                    TraceLivePublish(now, "--", "DONE", 0, 0, "DONE", 0U, 1);
+                }
+            }
+            osDelay(AppMsToTicks(CAR_CONTROL_PERIOD_MS));
+            continue;
+        }
+#endif
 #if (ENCODER_ONLY_EXPERIMENT_MODE == 1)
         {
             int experimentLeft = 0;
             int experimentRight = 0;
 #if (ENCODER_BPATH_FOLLOW_V1_TEST_MODE == 1)
             uint32_t terminalDelayMs = 0U;
-            BPathFollowStep(now, &experimentLeft, &experimentRight);
-            if (BPathFollowTakeTerminalExecutionRequest(&terminalDelayMs) != 0) {
+            BpathControlConsumeCommand(now);
+            if (g_bpathControlState == BPATH_CONTROL_BPATH_RETURN) {
+                BPathFollowStep(now, &experimentLeft, &experimentRight);
+            }
+            if (g_bpathControlState == BPATH_CONTROL_BPATH_RETURN &&
+                BPathFollowTakeTerminalExecutionRequest(&terminalDelayMs) != 0) {
                 uint32_t waitStartUs;
                 uint32_t actualWaitUs;
                 uint32_t actualStopMs;
@@ -4258,6 +5722,9 @@ static void CarControlTask(void *argument)
                 BPathFollowNotifyTerminalStopExecuted(actualStopMs, actualWaitUs);
             } else {
                 EncoderExperimentSendMotorCommand(experimentLeft, experimentRight, now);
+            }
+            if (g_bpathControlState == BPATH_CONTROL_BPATH_RETURN && BPathFollowIsFinished() != 0) {
+                BpathControlFinish();
             }
 #elif (ENCODER_SEGMENT_B_PROGRESS_TEST_MODE == 1)
             BProgressStep(now, &experimentLeft, &experimentRight);
@@ -4390,7 +5857,8 @@ static void CarControlTask(void *argument)
         if (mode == CAR_MODE_TRACE) {
 #if (CAR_TRACE_TEST_MODE == 1)
             if (traceModeStarted == 0) {
-                if ((uint32_t)(now - traceModeStartTick) < AppMsToTicks(TRACE_START_DELAY_MS)) {
+                if (g_bpathAutoBootRun == 0U &&
+                    (uint32_t)(now - traceModeStartTick) < AppMsToTicks(TRACE_START_DELAY_MS)) {
                     osDelay(AppMsToTicks(CAR_CONTROL_PERIOD_MS));
                     continue;
                 }
@@ -4401,6 +5869,8 @@ static void CarControlTask(void *argument)
 #if (TRACE_RACE_TEST_MODE == 1)
             if (LineSensorRead(&left, &right) != 1) {
                 TraceResetDebounce();
+                AutoReturn11Reset();
+                TraceResetState11Counter();
                 TraceApplyAction(TRACE_ACTION_STOP);
                 if (sensorReadFailed == 0) {
                     printf("TRACE sensor read failed\r\n");
@@ -4631,17 +6101,24 @@ static void CarControlTask(void *argument)
             osDelay(AppMsToTicks(CAR_CONTROL_PERIOD_MS));
             continue;
 #endif
-            if (LineSensorRead(&left, &right) != 1) {
+            int traceDiagRawLeft = -1;
+            int traceDiagRawRight = -1;
+            if (lineLiveSensorValid == 0) {
                 TraceResetDebounce();
                 TraceApplyAction(TRACE_ACTION_STOP);
+                LineLiveSetControl("TRACE", "STOP", 0, 0);
                 if (sensorReadFailed == 0) {
                     printf("TRACE sensor read failed\r\n");
                     sensorReadFailed = 1;
                 }
             } else {
+                left = lineLiveRawLeft;
+                right = lineLiveRawRight;
                 sensorReadFailed = 0;
                 WifiIotGpioValue rawLeft = left;
                 WifiIotGpioValue rawRight = right;
+                traceDiagRawLeft = (int)rawLeft;
+                traceDiagRawRight = (int)rawRight;
                 (void)rawLeft; (void)rawRight;
                 int stableChanged = TraceUpdateStableState(left, right);
                 if (stableChanged != 0) {
@@ -4655,9 +6132,73 @@ static void CarControlTask(void *argument)
                            WIFI_IOT_GPIO_VALUE1 : WIFI_IOT_GPIO_VALUE0;
                     right = ((g_stableState & 0x01U) != 0U) ?
                             WIFI_IOT_GPIO_VALUE1 : WIFI_IOT_GPIO_VALUE0;
+#if (ENCODER_BPATH_FOLLOW_V1_TEST_MODE == 1)
+                    if (g_bpathControlState == BPATH_CONTROL_TRACE_ARM &&
+                        (g_bpathAutoBootRun == 0U ||
+                         BpathControlEncoderReady() != 0) &&
+                        BpathControlBeginTraceRecord(now) != 0) {
+                        EncoderExperimentSendMotorCommand(0, 0, now);
+                    }
+                    if (g_bpathControlState == BPATH_CONTROL_TRACE_RECORD) {
+#if (AUTO_RETURN_ON_11_TEST_MODE == 1)
+                        if (g_bpathAutoBootRun != 0U && g_stableState == 0x03U) {
+                            if (g_autoReturn11Active == 0U) {
+                                g_autoReturn11Active = 1U;
+                                g_autoReturn11StartTick = now;
+                            }
+                            if ((uint32_t)(now - g_autoReturn11StartTick) <
+                                AppMsToTicks(AUTO_RETURN_11_CONFIRM_MS)) {
+                                TraceResetRecovery();
+                                g_lastCorrection = TRACE_CORRECTION_RIGHT;
+                                TraceApplyAction(TRACE_ACTION_RIGHT);
+                                TraceUpdateUdpTelemetry();
+                                TraceLivePublish(now, "11", "RIGHT_11", 110, 90,
+                                                 "TRACE", TRACE_LIVE_FORWARD_PERIOD_MS, 0);
+                            } else {
+                            if (BPathExternalHasForwardMovement() == 0) {
+                                TraceApplyAction(TRACE_ACTION_STOP);
+                                BPathExternalAbort("EMPTY_FORWARD_PATH");
+                                TraceLivePublish(now, "11", "RETURN_TRIGGER", 0, 0,
+                                                 "RETURN", 0U, 1);
+                                BpathControlFinish();
+                                TraceLivePublish(now, "--", "DONE", 0, 0,
+                                                 "DONE", 0U, 1);
+                            } else {
+                                TraceApplyAction(TRACE_ACTION_STOP);
+                                TraceLivePublish(now, "11", "RETURN_TRIGGER", 0, 0,
+                                                 "RETURN", 0U, 1);
+                                (void)BpathControlBeginReturn(now);
+                            }
+                            }
+                        } else
+#endif
+                        {
+                        AutoReturn11Reset();
+#if (TRACE_OPEN_LOOP_STRAIGHT_TEST_MODE == 1)
+                        TraceOpenLoopStraightStep(traceDiagRawLeft, traceDiagRawRight, now);
+#else
+                        TraceControlStep(rawLeft, rawRight, now);
+#endif
+                        TraceCurveObserve(now, rawLeft, rawRight);
+                        /* Snapshot only: socket I/O is owned by UdpTelemetryTask. */
+                        TraceUpdateUdpTelemetry();
+                        {
+                            char sensorText[3];
+                            sensorText[0] = ((g_stableState & 0x02U) != 0U) ? '1' : '0';
+                            sensorText[1] = ((g_stableState & 0x01U) != 0U) ? '1' : '0';
+                            sensorText[2] = '\0';
+                            TraceLivePublish(now, sensorText,
+                                TraceRecordDiagActionName(g_lastAction),
+                                g_motorLeftCommand, g_motorRightCommand, "TRACE",
+                                TRACE_LIVE_FORWARD_PERIOD_MS, 0);
+                        }
+                        }
+                    }
+#else
                     TraceControlStep(left, right, now);
                     /* Snapshot only: socket I/O is owned by UdpTelemetryTask. */
                     TraceUpdateUdpTelemetry();
+#endif
                 }
 #if (TRACE_SHARP_TURN_DIAG_MODE == 1)
                 TraceDiagPoll(rawLeft, rawRight, stableChanged, now);
@@ -4665,6 +6206,15 @@ static void CarControlTask(void *argument)
             }
             TraceHeartbeatIfDue(now);
             TraceBleDiagHeartbeat(now);
+#if (ENCODER_BPATH_FOLLOW_V1_TEST_MODE == 1)
+            if (g_bpathControlState == BPATH_CONTROL_TRACE_RECORD) {
+                TraceRecordDiagPublish(traceDiagRawLeft, traceDiagRawRight, now);
+                if (BPathExternalRecordStep(now) != 0) {
+                    EncoderExperimentSendMotorCommand(0, 0, now);
+                    BpathControlAbort("FORWARD_RECORD_FAILURE");
+                }
+            }
+#endif
 #endif
 #endif
         } else if (mode == CAR_MODE_AVOID) {
@@ -4743,6 +6293,81 @@ void CarControlSetMode(CarMode mode)
 CarMode CarControlGetMode(void)
 {
     return g_carMode;
+}
+
+void CarControlSubmitBpathCommand(BpathControlCommand command)
+{
+    CarControlSubmitBpathCommandFromSource(command, BPATH_COMMAND_SOURCE_NONE);
+}
+
+void CarControlSubmitBpathCommandFromSource(BpathControlCommand command,
+                                            BpathCommandSource source)
+{
+#if (MOTOR_TURN_DIRECTION_TEST_MODE == 1)
+    if (command == BPATH_CONTROL_COMMAND_RESET) {
+        g_motorTurnDirectionPendingCommand = MOTOR_TURN_DIRECTION_COMMAND_STOP;
+    }
+#elif (ENCODER_BPATH_FOLLOW_V1_TEST_MODE == 1) && (LINE_SENSOR_SIDE_TEST_MODE == 0)
+    if (command == BPATH_CONTROL_COMMAND_START ||
+        command == BPATH_CONTROL_COMMAND_RETURN ||
+        command == BPATH_CONTROL_COMMAND_RESET) {
+        g_bpathPendingCommand = command;
+        g_bpathPendingSource = source;
+    }
+#else
+    (void)command;
+    (void)source;
+#endif
+}
+
+void CarControlSubmitMotorTurnDirectionCommand(MotorTurnDirectionCommand command)
+{
+#if (MOTOR_TURN_DIRECTION_TEST_MODE == 1)
+    if (command == MOTOR_TURN_DIRECTION_COMMAND_LEFT ||
+        command == MOTOR_TURN_DIRECTION_COMMAND_RIGHT ||
+        command == MOTOR_TURN_DIRECTION_COMMAND_FORWARD ||
+        command == MOTOR_TURN_DIRECTION_COMMAND_STOP) {
+        g_motorTurnDirectionPendingCommand = command;
+    }
+#else
+    (void)command;
+#endif
+}
+
+void CarControlSubmitTraceStepResponseCommand(TraceStepResponseCommand command)
+{
+#if (TRACE_STEP_RESPONSE_TEST_MODE == 1)
+    if (command >= TRACE_STEP_RESPONSE_COMMAND_LEFT_100 &&
+        command <= TRACE_STEP_RESPONSE_COMMAND_STOP) {
+        g_traceStepResponsePendingCommand = command;
+    }
+#else
+    (void)command;
+#endif
+}
+
+void CarControlSubmitTraceObserverCommand(TraceObserverCommand command)
+{
+#if (TRACE_OBSERVER_TEST_MODE == 1)
+    if (command == TRACE_OBSERVER_COMMAND_START ||
+        command == TRACE_OBSERVER_COMMAND_STOP) {
+        g_traceObserverPendingCommand = command;
+    }
+#else
+    (void)command;
+#endif
+}
+
+void CarControlSubmitMotorResponseCommand(MotorResponseCommand command)
+{
+#if (MOTOR_RESPONSE_TEST_MODE == 1)
+    if (command == MOTOR_RESPONSE_COMMAND_START ||
+        command == MOTOR_RESPONSE_COMMAND_STOP) {
+        g_motorResponsePendingCommand = command;
+    }
+#else
+    (void)command;
+#endif
 }
 
 int CarControlReverseV8TestModeEnabled(void)

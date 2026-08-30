@@ -6,16 +6,21 @@
 #include "app_time.h"
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
+#include "task_car_control.h"
 #include "task_wifi.h"
 #include "udp_telemetry.h"
 
 #define UDP_TELEMETRY_HOST "192.168.137.1"
 #define UDP_TELEMETRY_PORT 5005U
+#define UDP_COMMAND_PORT 7788U
 #define UDP_TELEMETRY_PERIOD_MS 100U
 #define UDP_TELEMETRY_HEARTBEAT_MS 1000U
 #define UDP_TELEMETRY_SOCKET_RETRY_MS 2000U
 #define UDP_TELEMETRY_SEND_ERROR_LOG_MS 5000U
 #define UDP_TELEMETRY_THREAD_STACK_SIZE 4096U
+#define UDP_COMMAND_THREAD_STACK_SIZE 2048U
+#define UDP_COMMAND_RX_BUFFER_SIZE 32U
+#define UDP_COMMAND_RECV_TIMEOUT_MS 200U
 #define UDP_TELEMETRY_TEXT_BUFFER_SIZE 768U
 #define UDP_REPLAY_EVENT_QUEUE_CAPACITY 16U
 #define UDP_EXPERIMENT_EVENT_QUEUE_CAPACITY 8U
@@ -68,6 +73,7 @@ void UdpTelemetryReadEncoder(UdpEncoderTelemetryState *state)
     *state = g_encoder;
 }
 static int g_udpTelemetryTaskStarted;
+static int g_udpCommandTaskStarted;
 static volatile uint32_t g_calGeneration;
 static char g_calText[768];
 
@@ -624,6 +630,206 @@ static int UdpTelemetryCreateSocket(struct sockaddr_in *target)
 
     socketFd = socket(AF_INET, SOCK_DGRAM, 0);
     return socketFd;
+}
+
+static int UdpCommandCreateSocket(void)
+{
+    struct sockaddr_in local;
+    struct timeval receiveTimeout;
+    int socketFd;
+
+    socketFd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (socketFd < 0) {
+        return -1;
+    }
+    (void)memset(&local, 0, sizeof(local));
+    local.sin_family = AF_INET;
+    local.sin_port = htons(UDP_COMMAND_PORT);
+    local.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(socketFd, (const struct sockaddr *)&local, sizeof(local)) != 0) {
+        (void)lwip_close(socketFd);
+        return -1;
+    }
+    receiveTimeout.tv_sec = 0;
+    receiveTimeout.tv_usec = UDP_COMMAND_RECV_TIMEOUT_MS * 1000U;
+    if (setsockopt(socketFd, SOL_SOCKET, SO_RCVTIMEO, &receiveTimeout,
+                   sizeof(receiveTimeout)) != 0) {
+        (void)lwip_close(socketFd);
+        return -1;
+    }
+    return socketFd;
+}
+
+static const char *UdpCommandHandlePayload(const char *payload, int length,
+                                           const struct sockaddr_in *sender)
+{
+    if (length > 0 && payload[length - 1] == '\r') {
+        length--;
+    } else if (length > 0 && payload[length - 1] == '\n') {
+        length--;
+        if (length > 0 && payload[length - 1] == '\r') {
+            length--;
+        }
+    }
+
+    if (length == (int)(sizeof("BPATH START") - 1U) &&
+        memcmp(payload, "BPATH START", sizeof("BPATH START") - 1U) == 0) {
+        CarControlSubmitBpathCommandFromSource(BPATH_CONTROL_COMMAND_START,
+                                               BPATH_COMMAND_SOURCE_UDP);
+        return "OK START";
+    }
+    if (length == (int)(sizeof("BPATH RETURN") - 1U) &&
+        memcmp(payload, "BPATH RETURN", sizeof("BPATH RETURN") - 1U) == 0) {
+        char text[160];
+
+        (void)snprintf(text, sizeof(text),
+            "BPATHCMD event=RX cmd=RETURN source_ip=%s source_port=%u",
+            inet_ntoa(sender->sin_addr), (unsigned int)ntohs(sender->sin_port));
+        (void)UdpTelemetryQueueExperimentText(text);
+        CarControlSubmitBpathCommandFromSource(BPATH_CONTROL_COMMAND_RETURN,
+                                               BPATH_COMMAND_SOURCE_UDP);
+        return "OK RETURN";
+    }
+    if (length == (int)(sizeof("BPATH RESET") - 1U) &&
+        memcmp(payload, "BPATH RESET", sizeof("BPATH RESET") - 1U) == 0) {
+        CarControlSubmitBpathCommandFromSource(BPATH_CONTROL_COMMAND_RESET,
+                                               BPATH_COMMAND_SOURCE_UDP);
+        return "OK RESET";
+    }
+#if (MOTOR_RESPONSE_TEST_MODE == 1)
+    if (length == (int)(sizeof("MOTORCAL START") - 1U) &&
+        memcmp(payload, "MOTORCAL START", sizeof("MOTORCAL START") - 1U) == 0) {
+        CarControlSubmitMotorResponseCommand(MOTOR_RESPONSE_COMMAND_START);
+        return "OK MOTORCAL START";
+    }
+    if (length == (int)(sizeof("MOTORCAL STOP") - 1U) &&
+        memcmp(payload, "MOTORCAL STOP", sizeof("MOTORCAL STOP") - 1U) == 0) {
+        CarControlSubmitMotorResponseCommand(MOTOR_RESPONSE_COMMAND_STOP);
+        return "OK MOTORCAL STOP";
+    }
+#endif
+#if (MOTOR_TURN_DIRECTION_TEST_MODE == 1)
+    if (length == (int)(sizeof("TURNTEST LEFT") - 1U) &&
+        memcmp(payload, "TURNTEST LEFT", sizeof("TURNTEST LEFT") - 1U) == 0) {
+        CarControlSubmitMotorTurnDirectionCommand(MOTOR_TURN_DIRECTION_COMMAND_LEFT);
+        return "OK TURNTEST LEFT";
+    }
+    if (length == (int)(sizeof("TURNTEST RIGHT") - 1U) &&
+        memcmp(payload, "TURNTEST RIGHT", sizeof("TURNTEST RIGHT") - 1U) == 0) {
+        CarControlSubmitMotorTurnDirectionCommand(MOTOR_TURN_DIRECTION_COMMAND_RIGHT);
+        return "OK TURNTEST RIGHT";
+    }
+    if (length == (int)(sizeof("TURNTEST FWD") - 1U) &&
+        memcmp(payload, "TURNTEST FWD", sizeof("TURNTEST FWD") - 1U) == 0) {
+        CarControlSubmitMotorTurnDirectionCommand(MOTOR_TURN_DIRECTION_COMMAND_FORWARD);
+        return "OK TURNTEST FWD";
+    }
+    if (length == (int)(sizeof("TURNTEST STOP") - 1U) &&
+        memcmp(payload, "TURNTEST STOP", sizeof("TURNTEST STOP") - 1U) == 0) {
+        CarControlSubmitMotorTurnDirectionCommand(MOTOR_TURN_DIRECTION_COMMAND_STOP);
+        return "OK TURNTEST STOP";
+    }
+#endif
+#if (TRACE_OBSERVER_TEST_MODE == 1)
+    if (length == (int)(sizeof("TRACEOBS START") - 1U) &&
+        memcmp(payload, "TRACEOBS START", sizeof("TRACEOBS START") - 1U) == 0) {
+        CarControlSubmitTraceObserverCommand(TRACE_OBSERVER_COMMAND_START);
+        return "OK TRACEOBS START";
+    }
+    if (length == (int)(sizeof("TRACEOBS STOP") - 1U) &&
+        memcmp(payload, "TRACEOBS STOP", sizeof("TRACEOBS STOP") - 1U) == 0) {
+        CarControlSubmitTraceObserverCommand(TRACE_OBSERVER_COMMAND_STOP);
+        return "OK TRACEOBS STOP";
+    }
+#endif
+#if (TRACE_STEP_RESPONSE_TEST_MODE == 1)
+    if (length == (int)(sizeof("TRACEPULSE LEFT 100") - 1U) &&
+        memcmp(payload, "TRACEPULSE LEFT 100", sizeof("TRACEPULSE LEFT 100") - 1U) == 0) {
+        CarControlSubmitTraceStepResponseCommand(TRACE_STEP_RESPONSE_COMMAND_LEFT_100);
+        return "OK TRACEPULSE LEFT 100";
+    }
+    if (length == (int)(sizeof("TRACEPULSE LEFT 200") - 1U) &&
+        memcmp(payload, "TRACEPULSE LEFT 200", sizeof("TRACEPULSE LEFT 200") - 1U) == 0) {
+        CarControlSubmitTraceStepResponseCommand(TRACE_STEP_RESPONSE_COMMAND_LEFT_200);
+        return "OK TRACEPULSE LEFT 200";
+    }
+    if (length == (int)(sizeof("TRACEPULSE LEFT 300") - 1U) &&
+        memcmp(payload, "TRACEPULSE LEFT 300", sizeof("TRACEPULSE LEFT 300") - 1U) == 0) {
+        CarControlSubmitTraceStepResponseCommand(TRACE_STEP_RESPONSE_COMMAND_LEFT_300);
+        return "OK TRACEPULSE LEFT 300";
+    }
+    if (length == (int)(sizeof("TRACEPULSE RIGHT 100") - 1U) &&
+        memcmp(payload, "TRACEPULSE RIGHT 100", sizeof("TRACEPULSE RIGHT 100") - 1U) == 0) {
+        CarControlSubmitTraceStepResponseCommand(TRACE_STEP_RESPONSE_COMMAND_RIGHT_100);
+        return "OK TRACEPULSE RIGHT 100";
+    }
+    if (length == (int)(sizeof("TRACEPULSE RIGHT 200") - 1U) &&
+        memcmp(payload, "TRACEPULSE RIGHT 200", sizeof("TRACEPULSE RIGHT 200") - 1U) == 0) {
+        CarControlSubmitTraceStepResponseCommand(TRACE_STEP_RESPONSE_COMMAND_RIGHT_200);
+        return "OK TRACEPULSE RIGHT 200";
+    }
+    if (length == (int)(sizeof("TRACEPULSE RIGHT 300") - 1U) &&
+        memcmp(payload, "TRACEPULSE RIGHT 300", sizeof("TRACEPULSE RIGHT 300") - 1U) == 0) {
+        CarControlSubmitTraceStepResponseCommand(TRACE_STEP_RESPONSE_COMMAND_RIGHT_300);
+        return "OK TRACEPULSE RIGHT 300";
+    }
+    if (length == (int)(sizeof("TRACEPULSE STOP") - 1U) &&
+        memcmp(payload, "TRACEPULSE STOP", sizeof("TRACEPULSE STOP") - 1U) == 0) {
+        CarControlSubmitTraceStepResponseCommand(TRACE_STEP_RESPONSE_COMMAND_STOP);
+        return "OK TRACEPULSE STOP";
+    }
+#endif
+
+#if (MOTOR_TURN_DIRECTION_TEST_MODE == 1)
+    (void)UdpTelemetryQueueExperimentText(
+        "TURNTEST event=IGNORE cmd=UDP reason=UNKNOWN");
+#elif (MOTOR_RESPONSE_TEST_MODE == 1)
+    (void)UdpTelemetryQueueExperimentText(
+        "MOTORCAL event=IGNORE cmd=UDP reason=UNKNOWN");
+#else
+    (void)UdpTelemetryQueueExperimentText(
+        "BPATHCTL event=IGNORE cmd=UDP reason=UNKNOWN");
+#endif
+    return "ERR UNKNOWN";
+}
+
+static void UdpCommandTask(void *argument)
+{
+    int socketFd = -1;
+
+    (void)argument;
+    printf("UDP command waiting network\r\n");
+    for (;;) {
+        if (TaskWifiIsNetworkReady() == 0) {
+            if (socketFd >= 0) {
+                (void)lwip_close(socketFd);
+                socketFd = -1;
+            }
+            osDelay(AppMsToTicks(UDP_TELEMETRY_PERIOD_MS));
+            continue;
+        }
+        if (socketFd < 0) {
+            socketFd = UdpCommandCreateSocket();
+            if (socketFd < 0) {
+                printf("UDP command socket create failed\r\n");
+                osDelay(AppMsToTicks(UDP_TELEMETRY_SOCKET_RETRY_MS));
+                continue;
+            }
+            printf("UDP command listening on %u\r\n", (unsigned int)UDP_COMMAND_PORT);
+        }
+        {
+            char payload[UDP_COMMAND_RX_BUFFER_SIZE];
+            struct sockaddr_in sender;
+            socklen_t senderLength = sizeof(sender);
+            int received = recvfrom(socketFd, payload, sizeof(payload), 0,
+                                    (struct sockaddr *)&sender, &senderLength);
+            if (received >= 0) {
+                const char *ack = UdpCommandHandlePayload(payload, received, &sender);
+                (void)sendto(socketFd, ack, strlen(ack), 0,
+                             (const struct sockaddr *)&sender, senderLength);
+            }
+        }
+    }
 }
 
 static int UdpTelemetrySend(int socketFd, const struct sockaddr_in *target,
@@ -2130,4 +2336,16 @@ void UdpTelemetryInit(void)
     g_udpTelemetryTaskStarted = 1;
     printf("UDP telemetry stack size = %u\r\n",
            (unsigned int)UDP_TELEMETRY_THREAD_STACK_SIZE);
+
+    if (g_udpCommandTaskStarted == 0) {
+        attr.name = "udp_command";
+        attr.stack_size = UDP_COMMAND_THREAD_STACK_SIZE;
+        if (osThreadNew(UdpCommandTask, NULL, &attr) == NULL) {
+            printf("UDP command thread create failed\r\n");
+            return;
+        }
+        g_udpCommandTaskStarted = 1;
+        printf("UDP command stack size = %u\r\n",
+               (unsigned int)UDP_COMMAND_THREAD_STACK_SIZE);
+    }
 }
