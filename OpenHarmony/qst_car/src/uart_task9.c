@@ -2,8 +2,11 @@
 #include <stdio.h>
 
 #include "cmsis_os2.h"
+#include "app_time.h"
 #include "wifiiot_uart.h"
 #include "uart_task9.h"
+#include "app_time.h"
+#include "udp_telemetry.h"
 
 #define UART_TASK9_PORT        WIFI_IOT_UART_IDX_2
 #define UART_FRAME_HEAD        0xFC
@@ -11,18 +14,50 @@
 #define UART_FRAME_LEN         6
 #define UART_TASK9_QUEUE_DEPTH 8
 #define UART_TASK9_LOG_PERIOD_MS 5000U
+#define ENCODER_FRAME_HEAD 0xEC
+#define ENCODER_FRAME_TAIL 0xED
+#define ENCODER_FRAME_LEN 8
 
 typedef struct {
     uint8_t data[UART_FRAME_LEN];
 } UartTask9Message;
 
 static osMessageQueueId_t g_uartTask9Queue;
+static uint32_t g_encoderValidCount;
+static uint32_t g_encoderBadChecksumCount;
+static uint32_t g_encoderBadFrameCount;
 
 /* The RX task only receives, frames, and queues data; it has no business logic. */
 static void UartTask9ParseByte(uint8_t byte)
 {
     static UartTask9Message frame;
     static uint32_t frameIndex;
+    static uint8_t encoderFrame[ENCODER_FRAME_LEN];
+    static uint8_t encoderIndex;
+
+    if (encoderIndex != 0U || byte == ENCODER_FRAME_HEAD) {
+        if (encoderIndex == 0U) encoderFrame[encoderIndex++] = byte;
+        else encoderFrame[encoderIndex++] = byte;
+        if (encoderIndex == ENCODER_FRAME_LEN) {
+            uint8_t checksum = (uint8_t)(encoderFrame[1] ^ encoderFrame[2] ^ encoderFrame[3] ^ encoderFrame[4] ^ encoderFrame[5]);
+            if (encoderFrame[0] == ENCODER_FRAME_HEAD && encoderFrame[7] == ENCODER_FRAME_TAIL) {
+                if (checksum == encoderFrame[6]) {
+                    UdpEncoderTelemetryState state;
+                    uint16_t ul = (uint16_t)encoderFrame[2] | ((uint16_t)encoderFrame[3] << 8);
+                    uint16_t ur = (uint16_t)encoderFrame[4] | ((uint16_t)encoderFrame[5] << 8);
+                    state.leftDelta = (int16_t)ul; state.rightDelta = (int16_t)ur;
+                    state.sequence = encoderFrame[1]; state.validCount = ++g_encoderValidCount;
+                    state.badChecksumCount = g_encoderBadChecksumCount;
+                    state.badFrameCount = g_encoderBadFrameCount;
+                    state.lastRxMs = AppTicksToMs(osKernelGetTickCount());
+                    { UdpEncoderTelemetryState p; UdpTelemetryReadEncoder(&p); state.totalLeft=p.totalLeft+state.leftDelta; state.totalRight=p.totalRight+state.rightDelta; }
+                    UdpTelemetryUpdateEncoder(&state);
+                } else g_encoderBadChecksumCount++;
+            } else g_encoderBadFrameCount++;
+            encoderIndex = 0U;
+        }
+        return;
+    }
 
     if (frameIndex == 0) {
         if (byte == UART_FRAME_HEAD) {
@@ -61,7 +96,7 @@ static void UartRxThread(void *argument)
             UartTask9ParseByte(byte);
         } else {
             /* Avoid a busy loop if the UART API reports a temporary error. */
-            osDelay(1);
+            osDelay(AppMsToTicks(1U));
         }
     }
 }
@@ -73,7 +108,7 @@ static void UartMsgThread(void *argument)
     uint32_t logPeriodTicks;
     (void)argument;
 
-    logPeriodTicks = UART_TASK9_LOG_PERIOD_MS * osKernelGetTickFreq() / 1000U;
+    logPeriodTicks = AppMsToTicks(UART_TASK9_LOG_PERIOD_MS);
 
     while (1) {
         if (osMessageQueueGet(g_uartTask9Queue, &message, NULL,

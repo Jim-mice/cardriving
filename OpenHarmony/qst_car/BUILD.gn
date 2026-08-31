@@ -19,11 +19,24 @@ static_library("qst_car") {
         "src/task_sht20.c",
         "src/task_ap3216.c",
         "src/task_sensor.c",
+        "src/line_sensor.c",
+        "src/task_car_control.c",
+        "src/udp_telemetry.c",
+        "src/task_cloud.c",
+        "src/oc_mqtt.c",
+        "src/oc_mqtt_profile_package.c",
         "src/hal_bsp_ssd1306.c",
         "src/hal_bsp_sht20.c",
         "src/hal_bsp_ap3216c.c",
         "src/trace_model.c",
         "src/uart_task9.c",
+        "src/task_encoder_cal.c",
+        "src/task_encoder_arc_roundtrip.c",
+        "src/task_encoder_right_arc_roundtrip.c",
+        "src/task_encoder_two_arc_roundtrip.c",
+        "src/task_encoder_segment_b_progress.c",
+        "src/task_encoder_bpath_follow.c",
+        "src/task_motor_response.c",
     ]
 
     include_dirs = [
@@ -40,7 +53,14 @@ static_library("qst_car") {
         "//vendor/hisi/hi3861/hi3861/third_party/lwip_sack/include",
 
         # MQTT
-        "//third_party/paho_mqtt/MQTTClient/src",
         "//third_party/paho_mqtt/MQTTPacket/src",
+        "//third_party/paho_mqtt/MQTTClient-C/src",
+        "//third_party/paho_mqtt/MQTTClient-C/src/liteOS",
+        "//third_party/cJSON",
+    ]
+
+    deps = [
+        "//third_party/paho_mqtt:pahomqtt_static",
+        "//third_party/cJSON:cjson_static",
     ]
 }

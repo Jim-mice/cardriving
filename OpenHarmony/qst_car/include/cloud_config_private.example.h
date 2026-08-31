@@ -1,0 +1,15 @@
+#ifndef QST_CAR_CLOUD_CONFIG_PRIVATE_H
+#define QST_CAR_CLOUD_CONFIG_PRIVATE_H
+
+/* Copy this file to cloud_config_private.h and fill in local credentials. */
+#define CLOUD_MQTT_SERVER "YOUR_MQTT_SERVER"
+#define CLOUD_MQTT_PORT   1883
+#define CLOUD_CLIENT_ID   "YOUR_CLIENT_ID"
+#define CLOUD_USERNAME    "YOUR_USERNAME"
+#define CLOUD_PASSWORD    "YOUR_PASSWORD"
+#define CLOUD_DEVICE_ID   "YOUR_DEVICE_ID"
+
+#define WIFI_STA_PASSWORD "YOUR_WIFI_PASSWORD"
+#define UDP_TELEMETRY_HOST "YOUR_TELEMETRY_HOST"
+
+#endif

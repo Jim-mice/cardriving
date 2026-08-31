@@ -2,20 +2,19 @@
 #include <stdio.h>
 
 #include "cmsis_os2.h"
+#include "app_time.h"
 #include "hal_bsp_ap3216c.h"
 #include "hal_bsp_sht20.h"
 #include "hal_bsp_ssd1306.h"
 #include "task_hcsr04.h"
 #include "task_sensor.h"
-#include "wifiiot_gpio.h"
+#include "line_sensor.h"
 
 #define SENSOR_POLL_PERIOD_MS 100
 #define SENSOR_IR_PERIOD_MS 200
 #define SENSOR_READ_PERIOD_MS 1000
 #define SENSOR_LOG_PERIOD_MS 5000
 #define SENSOR_OLED_PERIOD_MS 500
-#define SENSOR_IR_LEFT_GPIO WIFI_IOT_GPIO_IDX_13
-#define SENSOR_IR_RIGHT_GPIO WIFI_IOT_GPIO_IDX_14
 
 static volatile float g_temperature;
 static volatile float g_humidity;
@@ -24,6 +23,8 @@ static volatile uint16_t g_ir;
 static volatile uint16_t g_proximity;
 static volatile int g_sht20DataValid;
 static volatile int g_ap3216DataValid;
+static volatile int g_sht20SampleReady;
+static volatile int g_ap3216SampleReady;
 static int g_sensorTaskStarted;
 
 static void OledShowStatus(WifiIotGpioValue left, WifiIotGpioValue right)
@@ -71,16 +72,12 @@ static void SensorTask(void *argument)
     }
 
     for (;;) {
-        if ((elapsed % SENSOR_IR_PERIOD_MS) == 0U &&
-            GpioGetInputVal(SENSOR_IR_LEFT_GPIO, &left) == 0 &&
-            GpioGetInputVal(SENSOR_IR_RIGHT_GPIO, &right) == 0) {
-            if ((elapsed % SENSOR_LOG_PERIOD_MS) == 0U) {
-                printf("IR left: %d\r\n", (int)left);
-                printf("IR right: %d\r\n", (int)right);
-            }
+        if ((elapsed % SENSOR_IR_PERIOD_MS) == 0U) {
+            (void)LineSensorRead(&left, &right);
         }
         if ((elapsed % SENSOR_READ_PERIOD_MS) == 0U) {
             if (g_sht20DataValid != 0 && SHT20_ReadData((float *)&g_temperature, (float *)&g_humidity) == 0) {
+                g_sht20SampleReady = 1;
                 if ((elapsed % SENSOR_LOG_PERIOD_MS) == 0U) {
                     printf("temperature: %.2f C\r\n", (double)g_temperature);
                     printf("humidity: %.2f %%\r\n", (double)g_humidity);
@@ -90,6 +87,7 @@ static void SensorTask(void *argument)
             }
             if (g_ap3216DataValid != 0 && AP3216C_ReadData((uint16_t *)&g_ir, (uint16_t *)&g_light,
                 (uint16_t *)&g_proximity) == 0) {
+                g_ap3216SampleReady = 1;
                 if ((elapsed % SENSOR_LOG_PERIOD_MS) == 0U) {
                     printf("light: %u\r\n", (unsigned int)g_light);
                     printf("ir: %u\r\n", (unsigned int)g_ir);
@@ -102,7 +100,7 @@ static void SensorTask(void *argument)
         if ((elapsed % SENSOR_OLED_PERIOD_MS) == 0U) {
             OledShowStatus(left, right);
         }
-        osDelay(SENSOR_POLL_PERIOD_MS);
+        osDelay(AppMsToTicks(SENSOR_POLL_PERIOD_MS));
         elapsed += SENSOR_POLL_PERIOD_MS;
     }
 }
@@ -129,7 +127,8 @@ void TaskSensorInit(void)
 
 int TaskSensorGetSht20Latest(float *temperature, float *humidity)
 {
-    if (temperature == NULL || humidity == NULL || g_sht20DataValid == 0) {
+    if (temperature == NULL || humidity == NULL || g_sht20DataValid == 0 ||
+        g_sht20SampleReady == 0) {
         return 0;
     }
     *temperature = g_temperature;
@@ -139,7 +138,8 @@ int TaskSensorGetSht20Latest(float *temperature, float *humidity)
 
 int TaskSensorGetAp3216Latest(uint16_t *light, uint16_t *ir, uint16_t *proximity)
 {
-    if (light == NULL || ir == NULL || proximity == NULL || g_ap3216DataValid == 0) {
+    if (light == NULL || ir == NULL || proximity == NULL || g_ap3216DataValid == 0 ||
+        g_ap3216SampleReady == 0) {
         return 0;
     }
     *light = g_light;

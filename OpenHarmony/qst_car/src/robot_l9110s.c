@@ -12,6 +12,10 @@
 #include "hi_uart.h"
 
 uint8_t uart_sendbuf[20];
+static int g_motorLogInitialized = 1;
+static int g_lastMotorA;
+static int g_lastMotorB;
+
 
 /***通信协议***/
 /*
@@ -52,6 +56,15 @@ void stm32motor_control(int motorA, int motorB)
     uart_sendbuf[3] = B_dir;  // 右轮方向    0正转，1反转
     uart_sendbuf[4] = motorB; // 右轮速度
     uart_sendbuf[5] = 0xFD;   // 帧尾
+    if (g_motorLogInitialized == 0 || motorA != g_lastMotorA || motorB != g_lastMotorB) {
+        printf("TX MOTOR L=%d R=%d\r\n", motorA, motorB);
+        printf("TX %02X %02X %02X %02X %02X %02X\r\n",
+               uart_sendbuf[0], uart_sendbuf[1], uart_sendbuf[2],
+               uart_sendbuf[3], uart_sendbuf[4], uart_sendbuf[5]);
+        g_lastMotorA = motorA;
+        g_lastMotorB = motorB;
+        g_motorLogInitialized = 1;
+    }
     UartWrite(WIFI_IOT_UART_IDX_2, (unsigned char *)uart_sendbuf, 6);
 }
 

@@ -1,6 +1,8 @@
 #include <stdio.h>
 
 #include "cmsis_os2.h"
+#include "app_time.h"
+#include "cloud_config_private.h"
 #include "lwip/ip4_addr.h"
 #include "lwip/netif.h"
 #include "lwip/netifapi.h"
@@ -8,10 +10,9 @@
 #include "wifi_connect.h"
 
 #define WIFI_STA_SSID       "hamster"
-#define WIFI_STA_PASSWORD   "12345678"
-
 /* 0: waiting, 1: EnableWifi succeeded, -1: EnableWifi failed. */
 static volatile int g_wifiStaStartState;
+static volatile int g_wifiNetworkReady;
 
 static void WifiStaStartNotify(int result)
 {
@@ -60,9 +61,11 @@ static void WifiConnectTask(void *argument)
     result = WifiConnect(WIFI_STA_SSID, WIFI_STA_PASSWORD);
 
     if (result == 0) {
+        g_wifiNetworkReady = 1;
         printf("wifi connected\r\n");
         PrintWifiIp();
     } else {
+        g_wifiNetworkReady = 0;
         printf("wifi connect failed\r\n");
     }
 }
@@ -72,6 +75,7 @@ void TaskWifiInit(void)
     osThreadAttr_t connectAttr;
 
     g_wifiStaStartState = 0;
+    g_wifiNetworkReady = 0;
     WifiConnectSetStaStartCallback(WifiStaStartNotify);
 
     connectAttr.name = "wifi_connect";
@@ -92,9 +96,14 @@ int TaskWifiWaitStaStarted(uint32_t timeoutMs)
     uint32_t elapsed = 0;
 
     while (g_wifiStaStartState == 0 && elapsed < timeoutMs) {
-        osDelay(10);
+        osDelay(AppMsToTicks(10U));
         elapsed += 10;
     }
 
     return (int)g_wifiStaStartState;
+}
+
+int TaskWifiIsNetworkReady(void)
+{
+    return (int)g_wifiNetworkReady;
 }
