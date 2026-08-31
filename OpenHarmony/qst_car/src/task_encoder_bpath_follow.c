@@ -747,6 +747,16 @@ int BPathExternalGetForwardRecordIndex(uint16_t *index)
     return 0;
 }
 
+int BPathExternalGetForwardPointTravel(uint16_t index, int32_t *left, int32_t *right)
+{
+    if (left == NULL || right == NULL || index >= g_forwardCount) {
+        return -1;
+    }
+    *left = g_forwardPath[index].left;
+    *right = g_forwardPath[index].right;
+    return 0;
+}
+
 int BPathExternalMapForwardIndexToReference(uint16_t forwardIndex, uint16_t *referenceIndex)
 {
     uint16_t index;

@@ -135,6 +135,14 @@
 #define SECOND_STOP_LOOKAHEAD_TICKS 0U
 #define FORK_BACKOFF_SAMPLES 12U
 #define FORK_SELECT_MAX_MS 1200U
+/* Attended pre-E1 curve replay; isolated from ordinary TRACE semantics. */
+#define REENTRY_CURVE_EDGE_SKIP_SAMPLES 3U
+#define REENTRY_CURVE_LOOKBACK_SAMPLES 16U
+#define REENTRY_CURVE_MIN_SAMPLES 8U
+#define REENTRY_CURVE_MIN_RATIO_PERCENT 10U
+#define REENTRY_CAPTURE_STABLE_COUNT 2U
+#define REENTRY_APPROACH_TIMEOUT_MS 2000U
+#define REENTRY_FORCE_TIMEOUT_MS 1200U
 
 #define TRACE_FORWARD_SPEED    100
 #define TRACE_SLOW_PWM         90
@@ -534,6 +542,9 @@ typedef enum {
     BPATH_CONTROL_BPATH_RETURN,
     BPATH_CONTROL_FORK_READY,
     BPATH_CONTROL_FORK_SELECT,
+    BPATH_CONTROL_REENTRY_APPROACH,
+    BPATH_CONTROL_REENTRY_FORCE,
+    BPATH_CONTROL_REENTRY_TEST_FAILED,
     BPATH_CONTROL_DONE
 } BpathControlState;
 
@@ -600,6 +611,51 @@ typedef struct {
 } AutoForkReturn;
 
 static AutoForkReturn g_autoForkReturn;
+
+typedef enum {
+    REENTRY_CURVE_UNKNOWN = 0,
+    REENTRY_CURVE_LEFT,
+    REENTRY_CURVE_RIGHT,
+    REENTRY_CURVE_STRAIGHT
+} ReentryCurve;
+
+typedef enum {
+    REENTRY_TEST_IDLE = 0,
+    REENTRY_TEST_READY,
+    REENTRY_TEST_REFUSED,
+    REENTRY_TEST_APPROACH,
+    REENTRY_TEST_FORCE,
+    REENTRY_TEST_FAILED
+} ReentryTestState;
+
+typedef enum {
+    REENTRY_REPLAY_COMMAND_NONE = 0,
+    REENTRY_REPLAY_COMMAND_TURN,
+    REENTRY_REPLAY_COMMAND_FWD
+} ReentryReplayCommand;
+
+typedef struct {
+    ReentryCurve curve;
+    ReentryTestState state;
+    uint32_t eventId;
+    uint16_t forwardStartIndex;
+    uint16_t sampleCount;
+    uint64_t leftSum;
+    uint64_t rightSum;
+    int64_t diff;
+    uint32_t ratioPercent;
+    uint32_t startTick;
+    int32_t replayStartLeftEncoder;
+    int32_t replayStartRightEncoder;
+    uint32_t replayTurnCycles;
+    uint32_t replayFwdCycles;
+    uint8_t captureStableCount;
+    uint8_t replayEncoderBaselineValid;
+    uint8_t replayLastCommand;
+    uint8_t valid;
+} ReentryCurveTest;
+
+static ReentryCurveTest g_reentryCurveTest;
 static uint32_t g_traceLiveLastTick;
 static uint8_t g_autoReturn11Active;
 static uint32_t g_autoReturn11StartTick;
@@ -618,6 +674,14 @@ static void ElevenEventReset(void);
 static void ThreeElevenResetForTrace(void);
 static void ForkTestReset(void);
 static void AutoForkReturnReset(void);
+static void ReentryCurveTestReset(void);
+static void ReentryTestAutoStart(uint32_t now);
+static void ReentryTestStep(uint32_t now, WifiIotGpioValue rawLeft,
+                            WifiIotGpioValue rawRight, int sensorValid);
+static void ReentryReplayApply(ReentryReplayCommand command, int64_t travelLeft,
+                               int64_t travelRight, int64_t currentDiff,
+                               uint64_t currentTotal);
+static int ReentryTestStartNewTraceEpoch(uint32_t now);
 static const char *ForkTestDirectionName(uint8_t direction);
 static const char *ForkTestStateName(int state);
 
@@ -665,6 +729,7 @@ static void BpathControlFinish(void)
         TraceResetState11Counter();
         TraceClearActiveCorrection();
         TraceBiasReset(0U);
+        ReentryCurveTestReset();
         if (g_bpathAbortStop != 0U) {
             LineLiveSetControl("ABORT", "STOP", 0, 0);
         } else {
@@ -705,6 +770,7 @@ static void BpathControlReturnGuardBlock(const char *fromState,
     ThreeElevenResetForTrace();
     ForkTestReset();
     AutoForkReturnReset();
+    ReentryCurveTestReset();
     g_bpathControlState = BPATH_CONTROL_DISARMED;
     g_bpathAbortStop = 0U;
     LineLiveSetControl("DISARMED", "STOP", 0, 0);
@@ -754,6 +820,7 @@ static void BpathControlBeginRun(uint8_t autoBoot)
     ThreeElevenResetForTrace();
     AutoForkReturnReset();
     ForkTestReset();
+    ReentryCurveTestReset();
     BpathControlPublish(autoBoot != 0U ?
         "BPATHCTL event=AUTO_START state=TRACE_ARM" :
         "BPATHCTL event=START state=TRACE_ARM");
@@ -821,8 +888,22 @@ static int BpathControlBeginTraceRecord(uint32_t now)
     ElevenEventReset();
     ThreeElevenResetForTrace();
     AutoForkReturnReset();
+    ReentryCurveTestReset();
     g_traceRecordDiagStartPending = 1U;
     g_traceRecordDiagLastTick = 0U;
+    return 0;
+}
+
+/* A successful reentry has reached the correct line on a new route. Reuse the
+ * normal BPATH run and recorder initialization so no old wrong-branch path,
+ * ElevenEvent history, or SEQ11 working window crosses the epoch boundary. */
+static int ReentryTestStartNewTraceEpoch(uint32_t now)
+{
+    BpathControlBeginRun(0U);
+    if (BpathControlBeginTraceRecord(now) != 0) {
+        return -1;
+    }
+    printf("REENTRY event=NEW_TRACE_EPOCH seq_state=IDLE bpath=RECORDING\r\n");
     return 0;
 }
 
@@ -900,6 +981,7 @@ static void BpathControlConsumeCommand(uint32_t now)
         ThreeElevenResetForTrace();
         ForkTestReset();
         AutoForkReturnReset();
+        ReentryCurveTestReset();
 #if (LINE_SENSOR_ANALYSIS_MODE == 0) && (LINE_SENSOR_CALIBRATION_MODE == 0) && \
     (CAR_LINE_CALIBRATION_MODE == 0) && \
     (STM32_UART_LINK_TEST_MODE == 0) && \
@@ -2319,6 +2401,112 @@ static const ElevenEvent *ElevenEventFindById(uint32_t id)
     return NULL;
 }
 
+static const char *ReentryCurveName(ReentryCurve curve)
+{
+    if (curve == REENTRY_CURVE_LEFT) return "LEFT";
+    if (curve == REENTRY_CURVE_RIGHT) return "RIGHT";
+    if (curve == REENTRY_CURVE_STRAIGHT) return "STRAIGHT";
+    return "UNKNOWN";
+}
+
+static uint64_t ReentryUnsignedTravelDelta(int32_t newer, int32_t older)
+{
+    int64_t delta = (int64_t)newer - (int64_t)older;
+
+    return delta < 0 ? (uint64_t)(-delta) : (uint64_t)delta;
+}
+
+/* Read only E1-preceding encoder history once the final TWO_LONG decision is
+ * known.  The final edge samples are deliberately excluded from this curve
+ * estimate because they can belong to the intersection transition itself. */
+static void ReentryCurveLock(const ElevenEvent *firstEvent)
+{
+    uint16_t windowEnd;
+    uint16_t windowStart;
+    uint16_t index;
+    int32_t previousLeft;
+    int32_t previousRight;
+    uint64_t total;
+    uint64_t absoluteDiff;
+
+    ReentryCurveTestReset();
+    if (firstEvent == NULL || firstEvent->valid == 0U ||
+        firstEvent->forwardPathStartIndex == 0xffffU ||
+        firstEvent->forwardPathStartIndex <= REENTRY_CURVE_EDGE_SKIP_SAMPLES) {
+        printf("REENTRYCURVE event=LOCK e1=%u start_idx=%u samples=0 skip=%u left=0 right=0 diff=0 ratio=0 curve=UNKNOWN\r\n",
+               firstEvent == NULL ? 0U : (unsigned int)firstEvent->id,
+               firstEvent == NULL ? 0xffffU :
+                   (unsigned int)firstEvent->forwardPathStartIndex,
+               (unsigned int)REENTRY_CURVE_EDGE_SKIP_SAMPLES);
+        return;
+    }
+
+    windowEnd = (uint16_t)(firstEvent->forwardPathStartIndex -
+                           REENTRY_CURVE_EDGE_SKIP_SAMPLES - 1U);
+    windowStart = windowEnd >= (REENTRY_CURVE_LOOKBACK_SAMPLES - 1U) ?
+        (uint16_t)(windowEnd - (REENTRY_CURVE_LOOKBACK_SAMPLES - 1U)) : 0U;
+    if (BPathExternalGetForwardPointTravel(windowStart, &previousLeft,
+                                           &previousRight) != 0) {
+        printf("REENTRYCURVE event=LOCK e1=%u start_idx=%u samples=0 skip=%u left=0 right=0 diff=0 ratio=0 curve=UNKNOWN\r\n",
+               (unsigned int)firstEvent->id,
+               (unsigned int)firstEvent->forwardPathStartIndex,
+               (unsigned int)REENTRY_CURVE_EDGE_SKIP_SAMPLES);
+        return;
+    }
+
+    g_reentryCurveTest.eventId = firstEvent->id;
+    g_reentryCurveTest.forwardStartIndex = firstEvent->forwardPathStartIndex;
+    g_reentryCurveTest.sampleCount = (uint16_t)(windowEnd - windowStart + 1U);
+    for (index = (uint16_t)(windowStart + 1U); index <= windowEnd; index++) {
+        int32_t currentLeft;
+        int32_t currentRight;
+
+        if (BPathExternalGetForwardPointTravel(index, &currentLeft, &currentRight) != 0) {
+            ReentryCurveTestReset();
+            g_reentryCurveTest.eventId = firstEvent->id;
+            g_reentryCurveTest.forwardStartIndex = firstEvent->forwardPathStartIndex;
+            printf("REENTRYCURVE event=LOCK e1=%u start_idx=%u samples=0 skip=%u left=0 right=0 diff=0 ratio=0 curve=UNKNOWN\r\n",
+                   (unsigned int)firstEvent->id,
+                   (unsigned int)firstEvent->forwardPathStartIndex,
+                   (unsigned int)REENTRY_CURVE_EDGE_SKIP_SAMPLES);
+            return;
+        }
+        g_reentryCurveTest.leftSum += ReentryUnsignedTravelDelta(currentLeft, previousLeft);
+        g_reentryCurveTest.rightSum += ReentryUnsignedTravelDelta(currentRight, previousRight);
+        previousLeft = currentLeft;
+        previousRight = currentRight;
+    }
+
+    total = g_reentryCurveTest.leftSum + g_reentryCurveTest.rightSum;
+    g_reentryCurveTest.diff = (int64_t)g_reentryCurveTest.rightSum -
+                              (int64_t)g_reentryCurveTest.leftSum;
+    absoluteDiff = g_reentryCurveTest.diff < 0 ?
+        (uint64_t)(-g_reentryCurveTest.diff) : (uint64_t)g_reentryCurveTest.diff;
+    if (total != 0U) {
+        g_reentryCurveTest.ratioPercent = (uint32_t)((absoluteDiff * 100U) / total);
+    }
+    if (g_reentryCurveTest.sampleCount < REENTRY_CURVE_MIN_SAMPLES || total == 0U) {
+        g_reentryCurveTest.curve = REENTRY_CURVE_UNKNOWN;
+    } else if (absoluteDiff * 100U < total * REENTRY_CURVE_MIN_RATIO_PERCENT) {
+        g_reentryCurveTest.valid = 1U;
+        g_reentryCurveTest.curve = REENTRY_CURVE_STRAIGHT;
+    } else {
+        g_reentryCurveTest.valid = 1U;
+        g_reentryCurveTest.curve = g_reentryCurveTest.diff > 0 ?
+            REENTRY_CURVE_LEFT : REENTRY_CURVE_RIGHT;
+    }
+    printf("REENTRYCURVE event=LOCK e1=%u start_idx=%u samples=%u skip=%u left=%llu right=%llu diff=%lld ratio=%u curve=%s\r\n",
+           (unsigned int)g_reentryCurveTest.eventId,
+           (unsigned int)g_reentryCurveTest.forwardStartIndex,
+           (unsigned int)g_reentryCurveTest.sampleCount,
+           (unsigned int)REENTRY_CURVE_EDGE_SKIP_SAMPLES,
+           (unsigned long long)g_reentryCurveTest.leftSum,
+           (unsigned long long)g_reentryCurveTest.rightSum,
+           (long long)g_reentryCurveTest.diff,
+           (unsigned int)g_reentryCurveTest.ratioPercent,
+           ReentryCurveName(g_reentryCurveTest.curve));
+}
+
 /* Arm only from the final TWO_LONG semantic decision.  The persistent history
  * record, not the temporal active id, owns the target forward source index. */
 static int AutoForkArmTwoLong(const ElevenEvent *firstEvent)
@@ -2347,6 +2535,7 @@ static int AutoForkArmTwoLong(const ElevenEvent *firstEvent)
     g_autoForkReturn.returnCursor = 0U;
     g_autoForkReturn.backoffProgress = 0U;
     g_autoForkReturn.markReached = 0U;
+    ReentryCurveLock(firstEvent);
     printf("AUTOFORK event=ARM e1=%u e1_start=%u e1_end=%u current_forward=%u\r\n",
            (unsigned int)g_autoForkReturn.eventId,
            (unsigned int)g_autoForkReturn.forwardStartIndex,
@@ -7072,6 +7261,218 @@ static void AutoForkReturnReset(void)
     g_autoForkReturn.forwardEndIndex = 0xffffU;
 }
 
+static void ReentryCurveTestReset(void)
+{
+    g_reentryCurveTest = (ReentryCurveTest){0};
+    g_reentryCurveTest.curve = REENTRY_CURVE_UNKNOWN;
+    g_reentryCurveTest.state = REENTRY_TEST_IDLE;
+    g_reentryCurveTest.forwardStartIndex = 0xffffU;
+}
+
+static void ReentryTestFail(uint32_t now, const char *reason)
+{
+    uint32_t elapsedMs = AppTicksToMs(now - g_reentryCurveTest.startTick);
+
+    TraceApplyAction(TRACE_ACTION_STOP);
+    g_reentryCurveTest.state = REENTRY_TEST_FAILED;
+    g_bpathControlState = BPATH_CONTROL_REENTRY_TEST_FAILED;
+    printf("REENTRYTEST event=FAIL reason=%s elapsed_ms=%u turn_cycles=%u fwd_cycles=%u\r\n",
+           reason, (unsigned int)elapsedMs,
+           (unsigned int)g_reentryCurveTest.replayTurnCycles,
+           (unsigned int)g_reentryCurveTest.replayFwdCycles);
+    LineLiveSetControl("REENTRY_FAIL", "STOP", 0, 0);
+}
+
+/* This runs only on the owner-loop after READY_REENTRY has completed its
+ * explicit 0/0 cycle.  It does not write motors itself. */
+static void ReentryTestAutoStart(uint32_t now)
+{
+    if (g_reentryCurveTest.state != REENTRY_TEST_READY ||
+        g_bpathControlState != BPATH_CONTROL_FORK_READY ||
+        g_autoForkReturn.state != AUTO_FORK_READY_REENTRY) {
+        return;
+    }
+    if (g_reentryCurveTest.valid == 0U ||
+        (g_reentryCurveTest.curve != REENTRY_CURVE_LEFT &&
+         g_reentryCurveTest.curve != REENTRY_CURVE_RIGHT)) {
+        g_reentryCurveTest.state = REENTRY_TEST_REFUSED;
+        printf("REENTRYTEST event=AUTO_REFUSE curve=%s reason=CURVE_NOT_DIRECTIONAL\r\n",
+               ReentryCurveName(g_reentryCurveTest.curve));
+        return;
+    }
+    g_reentryCurveTest.state = REENTRY_TEST_APPROACH;
+    g_reentryCurveTest.startTick = now;
+    g_reentryCurveTest.captureStableCount = 0U;
+    /* The preceding reverse owner sent its own command stream; force TRACE to
+     * reissue the first forward approach command in this owner loop. */
+    g_motorCommandValid = 0U;
+    g_bpathControlState = BPATH_CONTROL_REENTRY_APPROACH;
+    printf("REENTRYTEST event=AUTO_START curve=%s reason=READY_REENTRY\r\n",
+           ReentryCurveName(g_reentryCurveTest.curve));
+}
+
+static void ReentryReplayApply(ReentryReplayCommand command, int64_t travelLeft,
+                               int64_t travelRight, int64_t currentDiff,
+                               uint64_t currentTotal)
+{
+    uint64_t targetTotal = g_reentryCurveTest.leftSum + g_reentryCurveTest.rightSum;
+    const char *commandName = command == REENTRY_REPLAY_COMMAND_TURN ?
+        ReentryCurveName(g_reentryCurveTest.curve) : "FWD";
+
+    if (command == REENTRY_REPLAY_COMMAND_TURN) {
+        g_reentryCurveTest.replayTurnCycles++;
+        if (g_reentryCurveTest.curve == REENTRY_CURVE_LEFT) {
+            TraceApplyAction(TRACE_ACTION_LEFT);
+            LineLiveSetControl("REENTRY_REPLAY", "REPLAY_LEFT",
+                               TRACE_SLOW_PWM, TRACE_FAST_PWM);
+        } else {
+            TraceApplyAction(TRACE_ACTION_RIGHT);
+            LineLiveSetControl("REENTRY_REPLAY", "REPLAY_RIGHT",
+                               TRACE_FAST_PWM, TRACE_SLOW_PWM);
+        }
+    } else {
+        g_reentryCurveTest.replayFwdCycles++;
+        /* Replay FWD is the frozen 100/100 primitive, not TRACE slow bias. */
+        TraceSendMotorCommand(TRACE_FORWARD_SPEED, TRACE_FORWARD_SPEED, 0);
+        g_lastAction = TRACE_ACTION_FORWARD;
+        LineLiveSetControl("REENTRY_REPLAY", "REPLAY_FWD",
+                           TRACE_FORWARD_SPEED, TRACE_FORWARD_SPEED);
+    }
+
+    if (g_reentryCurveTest.replayLastCommand != (uint8_t)command) {
+        printf("REENTRYREPLAY event=CONTROL cmd=%s travel_l=%lld travel_r=%lld current_diff=%lld current_total=%llu target_diff=%lld target_total=%llu\r\n",
+               commandName, (long long)travelLeft, (long long)travelRight,
+               (long long)currentDiff, (unsigned long long)currentTotal,
+               (long long)g_reentryCurveTest.diff,
+               (unsigned long long)targetTotal);
+        g_reentryCurveTest.replayLastCommand = (uint8_t)command;
+    }
+}
+
+/* This is the only experimental motor owner.  It runs only after the existing
+ * TWO_LONG reverse has parked at READY_REENTRY, so normal TRACE is untouched. */
+static void ReentryTestStep(uint32_t now, WifiIotGpioValue rawLeft,
+                            WifiIotGpioValue rawRight, int sensorValid)
+{
+    uint8_t rawState;
+    uint8_t targetState;
+    uint32_t elapsedMs;
+    UdpEncoderTelemetryState encoder;
+    int64_t travelLeft;
+    int64_t travelRight;
+    int64_t currentDiff;
+    int64_t signedCurrentDiff;
+    uint64_t currentTotal;
+    uint64_t targetTotal;
+    uint64_t targetAbsDiff;
+    ReentryReplayCommand replayCommand;
+
+    if (sensorValid == 0) {
+        ReentryTestFail(now, "SENSOR_READ_FAILURE");
+        return;
+    }
+    rawState = (uint8_t)((rawLeft == WIFI_IOT_GPIO_VALUE1 ? 2U : 0U) |
+                         (rawRight == WIFI_IOT_GPIO_VALUE1 ? 1U : 0U));
+    UdpTelemetryReadEncoder(&encoder);
+    (void)TraceUpdateStableState(rawLeft, rawRight);
+    elapsedMs = AppTicksToMs(now - g_reentryCurveTest.startTick);
+
+    if (g_reentryCurveTest.state == REENTRY_TEST_APPROACH) {
+        if (rawState == 0x03U) {
+            if (encoder.validCount == 0U) {
+                ReentryTestFail(now, "ENCODER_INVALID");
+                return;
+            }
+            g_reentryCurveTest.state = REENTRY_TEST_FORCE;
+            g_reentryCurveTest.startTick = now;
+            g_reentryCurveTest.captureStableCount = 0U;
+            g_reentryCurveTest.replayStartLeftEncoder = encoder.totalLeft;
+            g_reentryCurveTest.replayStartRightEncoder = encoder.totalRight;
+            g_reentryCurveTest.replayTurnCycles = 0U;
+            g_reentryCurveTest.replayFwdCycles = 0U;
+            g_reentryCurveTest.replayEncoderBaselineValid = 1U;
+            g_reentryCurveTest.replayLastCommand = REENTRY_REPLAY_COMMAND_NONE;
+            g_motorCommandValid = 0U;
+            g_bpathControlState = BPATH_CONTROL_REENTRY_FORCE;
+            printf("REENTRYTEST event=E1_RAW_ENTER raw=%u stable=%u curve=%s\r\n",
+                   (unsigned int)rawState, (unsigned int)g_stableState,
+                   ReentryCurveName(g_reentryCurveTest.curve));
+            printf("REENTRYREPLAY event=START curve=%s target_left=%llu target_right=%llu target_diff=%lld target_total=%llu target_ratio=%u\r\n",
+                   ReentryCurveName(g_reentryCurveTest.curve),
+                   (unsigned long long)g_reentryCurveTest.leftSum,
+                   (unsigned long long)g_reentryCurveTest.rightSum,
+                   (long long)g_reentryCurveTest.diff,
+                   (unsigned long long)(g_reentryCurveTest.leftSum +
+                                        g_reentryCurveTest.rightSum),
+                   (unsigned int)g_reentryCurveTest.ratioPercent);
+        } else if (elapsedMs >= REENTRY_APPROACH_TIMEOUT_MS) {
+            ReentryTestFail(now, "NO_E1");
+            return;
+        } else {
+            TraceControlStep(rawLeft, rawRight, now);
+            LineLiveSetControl("REENTRY_APPROACH", "TRACE", g_motorLeftCommand,
+                               g_motorRightCommand);
+            return;
+        }
+    }
+
+    if (g_reentryCurveTest.state != REENTRY_TEST_FORCE) {
+        return;
+    }
+    if (encoder.validCount == 0U || g_reentryCurveTest.replayEncoderBaselineValid == 0U) {
+        ReentryTestFail(now, "ENCODER_INVALID");
+        return;
+    }
+    targetState = g_reentryCurveTest.curve == REENTRY_CURVE_LEFT ? 0x02U : 0x01U;
+    if (rawState != 0x03U && g_stableStateValid != 0U && g_stableState == targetState) {
+        g_reentryCurveTest.captureStableCount++;
+        printf("REENTRYTEST event=CAPTURE_PROGRESS count=%u target=%u\r\n",
+               (unsigned int)g_reentryCurveTest.captureStableCount,
+               (unsigned int)targetState);
+        if (g_reentryCurveTest.captureStableCount >= REENTRY_CAPTURE_STABLE_COUNT) {
+            printf("REENTRYTEST event=SUCCESS curve=%s target_sensor=%u elapsed_ms=%u turn_cycles=%u fwd_cycles=%u\r\n",
+                   ReentryCurveName(g_reentryCurveTest.curve), (unsigned int)targetState,
+                   (unsigned int)AppTicksToMs(now - g_reentryCurveTest.startTick),
+                   (unsigned int)g_reentryCurveTest.replayTurnCycles,
+                   (unsigned int)g_reentryCurveTest.replayFwdCycles);
+            if (ReentryTestStartNewTraceEpoch(now) != 0) {
+                /* BpathControlBeginTraceRecord already follows its safe abort
+                 * path if the fresh encoder snapshot cannot start recording. */
+                TraceApplyAction(TRACE_ACTION_STOP);
+                LineLiveSetControl("REENTRY_FAIL", "STOP", 0, 0);
+            }
+            return;
+        }
+    } else {
+        g_reentryCurveTest.captureStableCount = 0U;
+    }
+    if (AppTicksToMs(now - g_reentryCurveTest.startTick) >= REENTRY_FORCE_TIMEOUT_MS) {
+        ReentryTestFail(now, "CAPTURE_TIMEOUT");
+        return;
+    }
+
+    travelLeft = (int64_t)encoder.totalLeft - (int64_t)g_reentryCurveTest.replayStartLeftEncoder;
+    travelRight = (int64_t)encoder.totalRight - (int64_t)g_reentryCurveTest.replayStartRightEncoder;
+    if (travelLeft < 0 || travelRight < 0) {
+        ReentryTestFail(now, "ENCODER_INVALID");
+        return;
+    }
+    currentTotal = (uint64_t)travelLeft + (uint64_t)travelRight;
+    currentDiff = travelRight - travelLeft;
+    signedCurrentDiff = g_reentryCurveTest.curve == REENTRY_CURVE_LEFT ?
+        currentDiff : -currentDiff;
+    targetTotal = g_reentryCurveTest.leftSum + g_reentryCurveTest.rightSum;
+    targetAbsDiff = g_reentryCurveTest.diff < 0 ?
+        (uint64_t)(-g_reentryCurveTest.diff) : (uint64_t)g_reentryCurveTest.diff;
+    if (currentTotal == 0U || signedCurrentDiff <= 0 ||
+        (uint64_t)signedCurrentDiff * targetTotal < targetAbsDiff * currentTotal) {
+        replayCommand = REENTRY_REPLAY_COMMAND_TURN;
+    } else {
+        replayCommand = REENTRY_REPLAY_COMMAND_FWD;
+    }
+    ReentryReplayApply(replayCommand, travelLeft, travelRight, currentDiff, currentTotal);
+}
+
 /* Shared FORKTEST/AUTOFORK reverse-progress rule.  The cursor is a reverse
  * reference/source sample cursor, not an owner-loop iteration counter. */
 static int ReturnMarkBackoffObserve(uint16_t markReferenceIndex,
@@ -7623,6 +8024,9 @@ static void CarControlTask(void *argument)
          * the motor owner so it can arbitrate this iteration's classifier. */
         forkTestClaimedThisLoop = ForkTestConsumeCommand();
 #endif
+#if (PRE_E1_CURVE_GUIDED_REENTRY_TEST_MODE == 1)
+        ReentryTestAutoStart(now);
+#endif
         if (g_bpathControlState != BPATH_CONTROL_TRACE_RECORD) {
             CrossbarObserverObserveNotTrace(now, lineLiveRawLeft, lineLiveRawRight);
         }
@@ -7637,6 +8041,23 @@ static void CarControlTask(void *argument)
             osDelay(AppMsToTicks(CAR_CONTROL_PERIOD_MS));
             continue;
         }
+#if (PRE_E1_CURVE_GUIDED_REENTRY_TEST_MODE == 1)
+        if (g_bpathControlState == BPATH_CONTROL_REENTRY_APPROACH ||
+            g_bpathControlState == BPATH_CONTROL_REENTRY_FORCE) {
+            /* Use this loop's same fresh raw snapshot.  No ElevenEvent or
+             * SEQ11 consumer runs while the attended reentry experiment owns
+             * the control loop. */
+            ReentryTestStep(now, lineLiveRawLeft, lineLiveRawRight, lineLiveSensorValid);
+            osDelay(AppMsToTicks(CAR_CONTROL_PERIOD_MS));
+            continue;
+        }
+        if (g_bpathControlState == BPATH_CONTROL_REENTRY_TEST_FAILED) {
+            EncoderExperimentSendMotorCommand(0, 0, now);
+            LineLiveSetControl("REENTRY_FAIL", "STOP", 0, 0);
+            osDelay(AppMsToTicks(CAR_CONTROL_PERIOD_MS));
+            continue;
+        }
+#endif
 #if (FORK_BACKTRACK_PROOF_TEST_MODE == 1)
         if (g_bpathControlState == BPATH_CONTROL_FORK_READY) {
             EncoderExperimentSendMotorCommand(0, 0, now);
@@ -7715,6 +8136,7 @@ static void CarControlTask(void *argument)
                 returnRight = 0;
                 g_manualReturnPipelineActive = 0U;
                 g_autoForkReturn.state = AUTO_FORK_READY_REENTRY;
+                g_reentryCurveTest.state = REENTRY_TEST_READY;
                 g_bpathControlState = BPATH_CONTROL_FORK_READY;
                 printf("AUTOFORK event=READY_REENTRY e1=%u backoff=%u\r\n",
                        (unsigned int)g_autoForkReturn.eventId,
@@ -8526,6 +8948,7 @@ void CarControlSubmitForkTestCommand(ForkTestCommand command)
     (void)command;
 #endif
 }
+
 
 void CarControlSubmitTraceObserverCommand(TraceObserverCommand command)
 {

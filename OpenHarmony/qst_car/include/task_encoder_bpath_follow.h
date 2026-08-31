@@ -30,6 +30,8 @@ void BPathExternalGetForwardRecordProgress(uint16_t *count, uint16_t *capacity);
 
 /* Test-only read-only path progress helpers; TaskCarControl still owns motors. */
 int BPathExternalGetForwardRecordIndex(uint16_t *index);
+/* Read-only cumulative encoder travel stored at one forward source point. */
+int BPathExternalGetForwardPointTravel(uint16_t index, int32_t *left, int32_t *right);
 int BPathExternalMapForwardIndexToReference(uint16_t forwardIndex, uint16_t *referenceIndex);
 int BPathExternalGetReturnReferenceCursor(uint16_t *referenceIndex);
 
