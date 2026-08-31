@@ -24,7 +24,7 @@
 #define UDP_TELEMETRY_TEXT_BUFFER_SIZE 768U
 #define UDP_REPLAY_EVENT_QUEUE_CAPACITY 16U
 #define UDP_EXPERIMENT_EVENT_QUEUE_CAPACITY 8U
-#define UDP_EXPERIMENT_EVENT_TEXT_SIZE 256U
+#define UDP_EXPERIMENT_EVENT_TEXT_SIZE 1024U
 
 static volatile uint32_t g_snapshotGeneration;
 static volatile CarTelemetryState g_snapshot;

@@ -90,6 +90,27 @@
 #define TRACE_BIAS_LONG_CORRECTION_MS 300U
 #define TRACE_BIAS_FWD_MIN_MS 300U
 #define TRACE_BIAS_DOMINANCE_MS 180U
+#define CROSSBAR_PRE_FWD_MS 180U
+#define CROSSBAR_MIN_BLACK_MS 50U
+#define CROSSBAR_MAX_EVENT_MS 500U
+#define CROSSBAR_COOLDOWN_MS 300U
+#define LONG_11_MIN_MS 120U
+#define LONG_11_COOLDOWN_MS 300U
+#define RIGHT_STOPLINE_CONTEXT_MAX_AGE_MS 120U
+#define RIGHT_STOPLINE_COOLDOWN_MS 120U
+/* Temporary integration mode: classify separated raw-11 episodes on this route. */
+#define DOUBLE_STOP_AUTO_RETURN_TEST_MODE 1
+/*
+ * Route-level provisional boundary.  After the first crossbar has cleared and
+ * normal FWD has resumed, the next confirmed 10/LEFT ends the second-line
+ * search as SINGLE.  Replace this with calibrated encoder distance later.
+ */
+#define PROVISIONAL_ROUTE_BOUNDARY_TEST_MODE 1
+/*
+ * Calibration required: max encoder travel from crossbar #1 exit to crossbar
+ * #2 entry.  Zero deliberately disables automatic SINGLE classification.
+ */
+#define SECOND_STOP_LOOKAHEAD_TICKS 0U
 
 #define TRACE_FORWARD_SPEED    100
 #define TRACE_SLOW_PWM         90
@@ -197,6 +218,29 @@ static uint32_t g_lineLiveBiasRightMs;
 static uint32_t g_lineLiveBiasFwdMs;
 static const char *g_lineLiveCorrection = "NONE";
 static uint32_t g_lineLiveCorrectionStartTick;
+static const char *g_lineLiveRightStopState = "IDLE";
+static uint32_t g_lineLiveRightStopContextAgeMs;
+static uint32_t g_lineLiveRightStopEntryCount;
+static uint32_t g_lineLiveRightStopCandidateCount;
+static uint32_t g_lineLiveRightStop11Ms;
+static uint32_t g_lineLiveRightStopLast11Ms;
+static char g_lineLiveRightStopLastExitRaw[3] = "--";
+static const char *g_lineLiveStopClassState = "WAIT_FIRST";
+static uint32_t g_lineLiveStopClassFirstCount;
+static uint32_t g_lineLiveStopClassSecondCount;
+static uint32_t g_lineLiveStopClassSingleCount;
+static uint32_t g_lineLiveStopClassDoubleCount;
+static uint32_t g_lineLiveStopClassProbeTicks;
+static uint8_t g_lineLiveStopClassProbeArmed;
+static uint32_t g_lineLiveStopClassLeftBoundaryCount;
+static int32_t g_lineLiveStopClassFirstExitLeft;
+static int32_t g_lineLiveStopClassFirstExitRight;
+static int32_t g_lineLiveStopClassSecondEnterLeft;
+static int32_t g_lineLiveStopClassSecondEnterRight;
+static const char *g_lineLiveStopClassDecision = "NONE";
+/* TaskCarControl owns LINE_LIVE formatting; static storage preserves its
+ * 4096-byte task stack while retaining every sticky classifier field. */
+static char g_lineLiveText[1024];
 
 static void LineLiveSetControl(const char *phase, const char *action,
                                int motorLeft, int motorRight)
@@ -240,7 +284,6 @@ static void LineLiveUpdateSensor(WifiIotGpioValue left, WifiIotGpioValue right,
 
 static void LineLivePublish(uint32_t now)
 {
-    char text[192];
     const char *sensor = "--";
 
     if ((uint32_t)(now - g_lineLiveLastTick) < AppMsToTicks(LINE_LIVE_PERIOD_MS)) {
@@ -255,8 +298,8 @@ static void LineLivePublish(uint32_t now)
         sensor = sensorText;
     }
     g_lineLiveSequence++;
-    (void)snprintf(text, sizeof(text),
-        "LINE_LIVE ms=%u seq=%u raw_l=%u raw_r=%u sensor=%s action=%s phase=%s motor_l=%d motor_r=%d corr_dir=%s corr_ms=%u bias=%s bias_left_ms=%u bias_right_ms=%u bias_fwd_ms=%u queue_fail=%u",
+    (void)snprintf(g_lineLiveText, sizeof(g_lineLiveText),
+        "LINE_LIVE ms=%u seq=%u raw_l=%u raw_r=%u sensor=%s action=%s phase=%s motor_l=%d motor_r=%d corr_dir=%s corr_ms=%u bias=%s bias_left_ms=%u bias_right_ms=%u bias_fwd_ms=%u queue_fail=%u rstop_state=%s rstop_ctx_age_ms=%u rstop_entry_count=%u rstop_candidate_count=%u rstop_11_ms=%u rstop_last_11_ms=%u rstop_last_exit_raw=%s stopcls_state=%s stopcls_first_count=%u stopcls_second_count=%u stopcls_single_count=%u stopcls_double_count=%u stopcls_probe_ticks=%u stopcls_probe_limit_ticks=%u stopcls_probe_armed=%u stopcls_left_boundary_count=%u stopcls_first_exit_enc_l=%ld stopcls_first_exit_enc_r=%ld stopcls_second_enter_enc_l=%ld stopcls_second_enter_enc_r=%ld stopcls_decision=%s",
         (unsigned int)AppTicksToMs(now), (unsigned int)g_lineLiveSequence,
         (unsigned int)g_lineLiveRawLeft, (unsigned int)g_lineLiveRawRight,
         sensor, g_lineLiveAction, g_lineLivePhase,
@@ -264,8 +307,27 @@ static void LineLivePublish(uint32_t now)
         g_lineLiveCorrection[0] == 'N' ? 0U : (unsigned int)AppTicksToMs(now - g_lineLiveCorrectionStartTick),
         g_lineLiveBias, (unsigned int)g_lineLiveBiasLeftMs,
         (unsigned int)g_lineLiveBiasRightMs, (unsigned int)g_lineLiveBiasFwdMs,
-        (unsigned int)g_lineLiveQueueFailCount);
-    if (UdpTelemetryQueueExperimentText(text) != 0) {
+        (unsigned int)g_lineLiveQueueFailCount, g_lineLiveRightStopState,
+        (unsigned int)g_lineLiveRightStopContextAgeMs,
+        (unsigned int)g_lineLiveRightStopEntryCount,
+        (unsigned int)g_lineLiveRightStopCandidateCount,
+        (unsigned int)g_lineLiveRightStop11Ms,
+        (unsigned int)g_lineLiveRightStopLast11Ms,
+        g_lineLiveRightStopLastExitRaw, g_lineLiveStopClassState,
+        (unsigned int)g_lineLiveStopClassFirstCount,
+        (unsigned int)g_lineLiveStopClassSecondCount,
+        (unsigned int)g_lineLiveStopClassSingleCount,
+        (unsigned int)g_lineLiveStopClassDoubleCount,
+        (unsigned int)g_lineLiveStopClassProbeTicks,
+        (unsigned int)SECOND_STOP_LOOKAHEAD_TICKS,
+        (unsigned int)g_lineLiveStopClassProbeArmed,
+        (unsigned int)g_lineLiveStopClassLeftBoundaryCount,
+        (long)g_lineLiveStopClassFirstExitLeft,
+        (long)g_lineLiveStopClassFirstExitRight,
+        (long)g_lineLiveStopClassSecondEnterLeft,
+        (long)g_lineLiveStopClassSecondEnterRight,
+        g_lineLiveStopClassDecision);
+    if (UdpTelemetryQueueExperimentText(g_lineLiveText) != 0) {
         g_lineLiveQueueFailCount++;
     }
     g_lineLiveLastTick = now;
@@ -383,6 +445,9 @@ static volatile BpathCommandSource g_bpathPendingSource;
 static BpathControlState g_bpathControlState = BPATH_CONTROL_DISARMED;
 static uint8_t g_bpathAutoBootRun;
 static uint8_t g_manualReturnAuthorized;
+/* Test-only, one-shot authorization for DOUBLE_STOP_AUTO_RETURN_TEST_MODE. */
+static uint8_t g_doubleStopReturnAuthorized;
+static uint8_t g_doubleStopTestReturnActive;
 static uint8_t g_manualReturnPipelineActive;
 static uint8_t g_bpathAbortStop;
 static const char *g_returnTrigger = "NONE";
@@ -394,6 +459,12 @@ static void TraceClearActiveCorrection(void);
 static void TraceBiasReset(uint32_t now);
 static void TraceCurveReset(void);
 static void TraceCurveEnd(uint32_t now, const char *reason);
+static void CrossbarObserverStop(uint32_t now, const char *reason);
+static void CrossbarRawForensicsReset(void);
+static void Long11ObserverReset(void);
+static void RightStoplineCandidateObserverReset(void);
+static void DoubleStopAutoReturnObserverReset(void);
+static void DoubleStopAutoReturnObserverDeactivate(void);
 
 static void BpathControlPublish(const char *event)
 {
@@ -425,9 +496,15 @@ static void BpathControlFinish(void)
 {
     if (g_bpathControlState != BPATH_CONTROL_DONE) {
         TraceCurveEnd(osKernelGetTickCount(), g_bpathAbortStop != 0U ? "ABORT" : "DONE");
+        CrossbarObserverStop(osKernelGetTickCount(), g_bpathAbortStop != 0U ? "ABORT" : "DONE");
+        CrossbarRawForensicsReset();
+        Long11ObserverReset();
+        RightStoplineCandidateObserverReset();
         g_bpathControlState = BPATH_CONTROL_DONE;
         g_manualReturnAuthorized = 0U;
+        g_doubleStopReturnAuthorized = 0U;
         g_manualReturnPipelineActive = 0U;
+        DoubleStopAutoReturnObserverDeactivate();
         g_returnTrigger = "NONE";
         AutoReturn11Reset();
         TraceResetState11Counter();
@@ -459,10 +536,16 @@ static void BpathControlReturnGuardBlock(const char *fromState,
     char text[176];
 
     g_manualReturnAuthorized = 0U;
+    g_doubleStopReturnAuthorized = 0U;
     g_manualReturnPipelineActive = 0U;
     g_returnTrigger = "NONE";
     g_bpathAutoBootRun = 0U;
     TraceCurveEnd(osKernelGetTickCount(), "ABORT");
+    CrossbarObserverStop(osKernelGetTickCount(), "GUARD_BLOCK");
+    CrossbarRawForensicsReset();
+    Long11ObserverReset();
+    RightStoplineCandidateObserverReset();
+    DoubleStopAutoReturnObserverReset();
     g_bpathControlState = BPATH_CONTROL_DISARMED;
     g_bpathAbortStop = 0U;
     LineLiveSetControl("DISARMED", "STOP", 0, 0);
@@ -491,6 +574,7 @@ static void BpathControlBeginRun(uint8_t autoBoot)
     BPathFollowInit();
     g_bpathAutoBootRun = autoBoot;
     g_manualReturnAuthorized = 0U;
+    g_doubleStopReturnAuthorized = 0U;
     g_manualReturnPipelineActive = 0U;
     g_bpathAbortStop = 0U;
     g_returnTrigger = "NONE";
@@ -502,6 +586,11 @@ static void BpathControlBeginRun(uint8_t autoBoot)
     TraceClearActiveCorrection();
     TraceBiasReset(osKernelGetTickCount());
     TraceCurveReset();
+    CrossbarObserverStop(osKernelGetTickCount(), "TRACE_INIT");
+    CrossbarRawForensicsReset();
+    Long11ObserverReset();
+    RightStoplineCandidateObserverReset();
+    DoubleStopAutoReturnObserverReset();
     BpathControlPublish(autoBoot != 0U ?
         "BPATHCTL event=AUTO_START state=TRACE_ARM" :
         "BPATHCTL event=START state=TRACE_ARM");
@@ -510,24 +599,35 @@ static void BpathControlBeginRun(uint8_t autoBoot)
 static int BpathControlBeginReturn(uint32_t now)
 {
     char text[128];
+    uint8_t authorized = g_manualReturnAuthorized;
 
-    if (g_manualReturnAuthorized == 0U) {
+#if (DOUBLE_STOP_AUTO_RETURN_TEST_MODE == 1)
+    if (g_doubleStopReturnAuthorized != 0U && g_doubleStopTestReturnActive != 0U) {
+        authorized = 1U;
+    }
+#endif
+    if (authorized == 0U) {
         BpathControlReturnGuardBlock("TRACE_RECORD", "RETURN_SETTLE");
         return -1;
     }
-    /* A fresh RETURN command grants exactly this one state transition. */
+    /* A fresh RETURN command or this explicit test gate grants one transition. */
     g_manualReturnAuthorized = 0U;
+    g_doubleStopReturnAuthorized = 0U;
     g_manualReturnPipelineActive = 1U;
     TraceCurveEnd(now, "RETURN");
     AutoReturn11Reset();
     TraceResetState11Counter();
     TraceClearActiveCorrection();
     TraceBiasReset(now);
+    CrossbarObserverStop(now, "RETURN");
+    CrossbarRawForensicsReset();
+    Long11ObserverReset();
+    RightStoplineCandidateObserverReset();
     BPathExternalRecordStop(now);
     g_bpathControlState = BPATH_CONTROL_RETURN_SETTLE;
     LineLiveSetControl("RETURN_SETTLE", "RETURN_SETTLE", 0, 0);
     (void)snprintf(text, sizeof(text),
-        "BPATHCTL event=RETURN state=RETURN_SETTLE trigger=MANUAL_%s",
+        "BPATHCTL event=RETURN state=RETURN_SETTLE trigger=%s",
         g_returnTrigger);
     BpathControlPublish(text);
     return 0;
@@ -550,6 +650,11 @@ static int BpathControlBeginTraceRecord(uint32_t now)
         return -1;
     }
     g_bpathControlState = BPATH_CONTROL_TRACE_RECORD;
+    CrossbarObserverStop(now, "TRACE_INIT");
+    CrossbarRawForensicsReset();
+    Long11ObserverReset();
+    RightStoplineCandidateObserverReset();
+    DoubleStopAutoReturnObserverReset();
     g_traceRecordDiagStartPending = 1U;
     g_traceRecordDiagLastTick = 0U;
     return 0;
@@ -595,7 +700,7 @@ static void BpathControlConsumeCommand(uint32_t now)
                 BpathControlPublish(text);
                 g_manualReturnAuthorized = 1U;
                 g_returnTrigger = source == BPATH_COMMAND_SOURCE_UDP ?
-                    "UDP" : "BLE";
+                    "MANUAL_UDP" : "MANUAL_BLE";
                 if (BpathControlBeginReturn(now) == 0) {
                     TraceLivePublishManualReturnTrigger(now, g_returnTrigger);
                 }
@@ -610,6 +715,7 @@ static void BpathControlConsumeCommand(uint32_t now)
         BPathFollowInit();
         g_bpathAutoBootRun = 0U;
         g_manualReturnAuthorized = 0U;
+        g_doubleStopReturnAuthorized = 0U;
         g_manualReturnPipelineActive = 0U;
         g_bpathAbortStop = 0U;
         g_returnTrigger = "NONE";
@@ -619,6 +725,11 @@ static void BpathControlConsumeCommand(uint32_t now)
         TraceClearActiveCorrection();
         TraceBiasReset(now);
         TraceCurveReset();
+        CrossbarObserverStop(now, "RESET");
+        CrossbarRawForensicsReset();
+        Long11ObserverReset();
+        RightStoplineCandidateObserverReset();
+        DoubleStopAutoReturnObserverReset();
 #if (LINE_SENSOR_ANALYSIS_MODE == 0) && (LINE_SENSOR_CALIBRATION_MODE == 0) && \
     (CAR_LINE_CALIBRATION_MODE == 0) && \
     (STM32_UART_LINK_TEST_MODE == 0) && \
@@ -1369,6 +1480,765 @@ static const char *TraceRecordDiagCorrectionName(TraceCorrection correction)
     if (correction == TRACE_CORRECTION_LEFT) return "LEFT";
     if (correction == TRACE_CORRECTION_RIGHT) return "RIGHT";
     return "NONE";
+}
+
+/* Event-only trace evidence; no detector or motor decision reads this state. */
+static void CrossbarStateText(uint8_t state, char text[3]);
+static uint8_t g_crossbarRawForensicsValid;
+static uint8_t g_crossbarRawForensicsPrevious;
+static uint32_t g_crossbarRawForensicsSequence;
+
+static void CrossbarRawForensicsReset(void)
+{
+    g_crossbarRawForensicsValid = 0U;
+    g_crossbarRawForensicsPrevious = 0U;
+}
+
+static void CrossbarRawForensicsPublish(uint32_t now, const char *event,
+                                        uint8_t previousState, uint8_t rawState)
+{
+    UdpEncoderTelemetryState encoder;
+    char previousText[3];
+    char rawText[3];
+    char stableText[3];
+    char text[240];
+    uint32_t correctionMs = g_activeCorrectionDirection == TRACE_CORRECTION_NONE ? 0U :
+        AppTicksToMs(now - g_activeCorrectionStartTick);
+
+    UdpTelemetryReadEncoder(&encoder);
+    CrossbarStateText(previousState, previousText);
+    CrossbarStateText(rawState, rawText);
+    CrossbarStateText(g_stableStateValid != 0U ? g_stableState : rawState, stableText);
+    (void)snprintf(text, sizeof(text),
+        "CROSSBAR_RAW%s seq=%u ms=%u prev=%s raw=%s stable=%s action=%s enc_l=%ld enc_r=%ld corr_dir=%s corr_ms=%u",
+        event != NULL ? event : "", (unsigned int)g_crossbarRawForensicsSequence,
+        (unsigned int)AppTicksToMs(now), previousText, rawText, stableText,
+        TraceRecordDiagActionName(g_lastAction), (long)encoder.totalLeft, (long)encoder.totalRight,
+        TraceRecordDiagCorrectionName(g_activeCorrectionDirection), (unsigned int)correctionMs);
+    (void)UdpTelemetryQueueExperimentText(text);
+}
+
+static void CrossbarRawForensicsObserve(uint32_t now, WifiIotGpioValue rawLeft,
+                                        WifiIotGpioValue rawRight)
+{
+    uint8_t rawState = (uint8_t)((rawLeft == WIFI_IOT_GPIO_VALUE1 ? 2U : 0U) |
+                                 (rawRight == WIFI_IOT_GPIO_VALUE1 ? 1U : 0U));
+    uint8_t previousState;
+
+    if (g_crossbarRawForensicsValid == 0U) {
+        g_crossbarRawForensicsValid = 1U;
+        g_crossbarRawForensicsPrevious = rawState;
+        return;
+    }
+    previousState = g_crossbarRawForensicsPrevious;
+    if (rawState == previousState) return;
+
+    g_crossbarRawForensicsSequence++;
+    CrossbarRawForensicsPublish(now, NULL, previousState, rawState);
+    if (previousState != 0x03U && rawState == 0x03U) {
+        CrossbarRawForensicsPublish(now, " event=ENTER_11", previousState, rawState);
+    } else if (previousState == 0x03U && rawState != 0x03U) {
+        CrossbarRawForensicsPublish(now, " event=EXIT_11", previousState, rawState);
+    }
+    g_crossbarRawForensicsPrevious = rawState;
+}
+
+/*
+ * Passive long-11 interval observer.  It only compresses a continuous raw
+ * 11 interval into telemetry; it has no connection to motor or BPATH control.
+ */
+typedef enum {
+    LONG_11_OBSERVER_IDLE = 0,
+    LONG_11_OBSERVER_IN_11,
+    LONG_11_OBSERVER_FIRED,
+    LONG_11_OBSERVER_COOLDOWN
+} Long11ObserverState;
+
+static Long11ObserverState g_long11ObserverState;
+static uint8_t g_long11CooldownClearSeen;
+static uint32_t g_long11EnterTick;
+static uint32_t g_long11CooldownStartTick;
+static uint32_t g_long11Sequence;
+static int32_t g_long11EnterEncoderLeft;
+static int32_t g_long11EnterEncoderRight;
+static uint8_t g_pre11RawValid;
+static uint8_t g_pre11PreviousRawState;
+static uint8_t g_pre11FwdContextActive;
+static uint32_t g_pre11FwdContextStartTick;
+
+static int32_t Long11Abs(int32_t value)
+{
+    return value < 0 ? -value : value;
+}
+
+static void Long11ObserverReset(void)
+{
+    g_long11ObserverState = LONG_11_OBSERVER_IDLE;
+    g_long11CooldownClearSeen = 0U;
+    g_long11EnterTick = 0U;
+    g_long11CooldownStartTick = 0U;
+    g_long11EnterEncoderLeft = 0;
+    g_long11EnterEncoderRight = 0;
+    g_pre11RawValid = 0U;
+    g_pre11PreviousRawState = 0U;
+    g_pre11FwdContextActive = 0U;
+    g_pre11FwdContextStartTick = 0U;
+}
+
+/* Evidence only: records the FWD/00 context that immediately precedes raw 11. */
+static void Pre11ContextObserve(uint32_t now, WifiIotGpioValue rawLeft,
+                                WifiIotGpioValue rawRight)
+{
+    UdpEncoderTelemetryState encoder;
+    uint8_t rawState = (uint8_t)((rawLeft == WIFI_IOT_GPIO_VALUE1 ? 2U : 0U) |
+                                 (rawRight == WIFI_IOT_GPIO_VALUE1 ? 1U : 0U));
+    uint8_t stableState = g_stableStateValid != 0U ? g_stableState : rawState;
+    char previousText[3];
+    char stableText[3];
+    char text[224];
+    uint32_t preFwdMs = 0U;
+
+    if (rawState == 0x00U && g_lastAction == TRACE_ACTION_FORWARD) {
+        if (g_pre11FwdContextActive == 0U) {
+            g_pre11FwdContextActive = 1U;
+            g_pre11FwdContextStartTick = now;
+        }
+    } else if (rawState != 0x03U) {
+        g_pre11FwdContextActive = 0U;
+        g_pre11FwdContextStartTick = 0U;
+    }
+
+    if (g_pre11RawValid == 0U) {
+        g_pre11RawValid = 1U;
+        g_pre11PreviousRawState = rawState;
+        return;
+    }
+    if (g_pre11PreviousRawState == 0x03U || rawState != 0x03U) {
+        g_pre11PreviousRawState = rawState;
+        return;
+    }
+
+    if (g_pre11FwdContextActive != 0U) {
+        preFwdMs = AppTicksToMs(now - g_pre11FwdContextStartTick);
+    }
+    UdpTelemetryReadEncoder(&encoder);
+    CrossbarStateText(g_pre11PreviousRawState, previousText);
+    CrossbarStateText(stableState, stableText);
+    (void)snprintf(text, sizeof(text),
+        "PRE11_CONTEXT ms=%u prev_raw=%s raw=11 stable=%s action=%s pre_fwd_ms=%u enc_l=%ld enc_r=%ld",
+        (unsigned int)AppTicksToMs(now), previousText, stableText,
+        TraceRecordDiagActionName(g_lastAction), (unsigned int)preFwdMs,
+        (long)encoder.totalLeft, (long)encoder.totalRight);
+    (void)UdpTelemetryQueueExperimentText(text);
+    g_pre11PreviousRawState = rawState;
+    g_pre11FwdContextActive = 0U;
+    g_pre11FwdContextStartTick = 0U;
+}
+
+static void Long11ObserverObserve(uint32_t now, WifiIotGpioValue rawLeft,
+                                  WifiIotGpioValue rawRight)
+{
+    UdpEncoderTelemetryState encoder;
+    uint8_t rawState = (uint8_t)((rawLeft == WIFI_IOT_GPIO_VALUE1 ? 2U : 0U) |
+                                 (rawRight == WIFI_IOT_GPIO_VALUE1 ? 1U : 0U));
+    uint32_t elapsedMs;
+    char text[224];
+
+    switch (g_long11ObserverState) {
+        case LONG_11_OBSERVER_IDLE:
+            if (rawState != 0x03U) break;
+            UdpTelemetryReadEncoder(&encoder);
+            g_long11EnterTick = now;
+            g_long11EnterEncoderLeft = encoder.totalLeft;
+            g_long11EnterEncoderRight = encoder.totalRight;
+            g_long11ObserverState = LONG_11_OBSERVER_IN_11;
+            (void)snprintf(text, sizeof(text),
+                "LONG_11_OBS event=ENTER ms=%u enter_enc_l=%ld enter_enc_r=%ld",
+                (unsigned int)AppTicksToMs(now), (long)encoder.totalLeft, (long)encoder.totalRight);
+            (void)UdpTelemetryQueueExperimentText(text);
+            break;
+
+        case LONG_11_OBSERVER_IN_11:
+            elapsedMs = AppTicksToMs(now - g_long11EnterTick);
+            if (rawState != 0x03U) {
+                (void)snprintf(text, sizeof(text),
+                    "LONG_11_OBS event=SHORT_EXIT duration_ms=%u",
+                    (unsigned int)elapsedMs);
+                (void)UdpTelemetryQueueExperimentText(text);
+                g_long11ObserverState = LONG_11_OBSERVER_IDLE;
+                break;
+            }
+            if (elapsedMs < LONG_11_MIN_MS) break;
+
+            UdpTelemetryReadEncoder(&encoder);
+            g_long11Sequence++;
+            (void)snprintf(text, sizeof(text),
+                "LONG_11_EVENT seq=%u threshold_ms=%u elapsed_ms=%u enter_enc_l=%ld enter_enc_r=%ld current_enc_l=%ld current_enc_r=%ld",
+                (unsigned int)g_long11Sequence, (unsigned int)LONG_11_MIN_MS,
+                (unsigned int)elapsedMs, (long)g_long11EnterEncoderLeft,
+                (long)g_long11EnterEncoderRight, (long)encoder.totalLeft, (long)encoder.totalRight);
+            (void)UdpTelemetryQueueExperimentText(text);
+            g_long11ObserverState = LONG_11_OBSERVER_FIRED;
+            break;
+
+        case LONG_11_OBSERVER_FIRED:
+            if (rawState == 0x03U) break;
+            UdpTelemetryReadEncoder(&encoder);
+            elapsedMs = AppTicksToMs(now - g_long11EnterTick);
+            (void)snprintf(text, sizeof(text),
+                "LONG_11_OBS event=EXIT total_11_ms=%u delta_l=%ld delta_r=%ld distance_ticks=%ld",
+                (unsigned int)elapsedMs, (long)(encoder.totalLeft - g_long11EnterEncoderLeft),
+                (long)(encoder.totalRight - g_long11EnterEncoderRight),
+                (long)((Long11Abs(encoder.totalLeft - g_long11EnterEncoderLeft) +
+                        Long11Abs(encoder.totalRight - g_long11EnterEncoderRight)) / 2));
+            (void)UdpTelemetryQueueExperimentText(text);
+            g_long11CooldownStartTick = now;
+            g_long11CooldownClearSeen = 1U;
+            g_long11ObserverState = LONG_11_OBSERVER_COOLDOWN;
+            break;
+
+        case LONG_11_OBSERVER_COOLDOWN:
+            if (rawState != 0x03U) g_long11CooldownClearSeen = 1U;
+            if (g_long11CooldownClearSeen != 0U &&
+                AppTicksToMs(now - g_long11CooldownStartTick) >= LONG_11_COOLDOWN_MS) {
+                g_long11ObserverState = LONG_11_OBSERVER_IDLE;
+            }
+            break;
+
+        default:
+            Long11ObserverReset();
+            break;
+    }
+}
+
+/*
+ * Passive RIGHT-context to raw-11 observer.  This only records a local sensor
+ * sequence; it neither changes TRACE decisions nor submits BPATH commands.
+ */
+typedef enum {
+    RIGHT_STOPLINE_OBSERVER_IDLE = 0,
+    RIGHT_STOPLINE_OBSERVER_CONTEXT,
+    RIGHT_STOPLINE_OBSERVER_IN_11,
+    RIGHT_STOPLINE_OBSERVER_COOLDOWN
+} RightStoplineObserverState;
+
+static RightStoplineObserverState g_rightStoplineObserverState;
+static uint8_t g_rightStoplinePreviousRawValid;
+static uint8_t g_rightStoplinePreviousRawState;
+static uint32_t g_rightStoplineContextLastTick;
+static uint32_t g_rightStoplineEnter11Tick;
+static uint32_t g_rightStoplineCooldownStartTick;
+
+static void RightStoplineRawText(uint8_t state, char text[3])
+{
+    text[0] = (state & 0x02U) != 0U ? '1' : '0';
+    text[1] = (state & 0x01U) != 0U ? '1' : '0';
+    text[2] = '\0';
+}
+
+static uint8_t RightStoplineActionIsRight(void)
+{
+    return g_lastAction == TRACE_ACTION_RIGHT ||
+           g_lastAction == TRACE_ACTION_RECOVER_RIGHT ||
+           g_lastAction == TRACE_ACTION_RIGHT_11;
+}
+
+static void RightStoplineCandidateObserverReset(void)
+{
+    g_rightStoplineObserverState = RIGHT_STOPLINE_OBSERVER_IDLE;
+    g_rightStoplinePreviousRawValid = 0U;
+    g_rightStoplinePreviousRawState = 0U;
+    g_rightStoplineContextLastTick = 0U;
+    g_rightStoplineEnter11Tick = 0U;
+    g_rightStoplineCooldownStartTick = 0U;
+    g_lineLiveRightStopState = "IDLE";
+    g_lineLiveRightStopContextAgeMs = 0U;
+    g_lineLiveRightStopEntryCount = 0U;
+    g_lineLiveRightStopCandidateCount = 0U;
+    g_lineLiveRightStop11Ms = 0U;
+    g_lineLiveRightStopLast11Ms = 0U;
+    g_lineLiveRightStopLastExitRaw[0] = '-';
+    g_lineLiveRightStopLastExitRaw[1] = '-';
+    g_lineLiveRightStopLastExitRaw[2] = '\0';
+}
+
+static void RightStoplineCandidateObserverObserve(uint32_t now,
+                                                  WifiIotGpioValue rawLeft,
+                                                  WifiIotGpioValue rawRight)
+{
+    uint8_t rawState = (uint8_t)((rawLeft == WIFI_IOT_GPIO_VALUE1 ? 2U : 0U) |
+                                 (rawRight == WIFI_IOT_GPIO_VALUE1 ? 1U : 0U));
+    uint8_t stableState = g_stableStateValid != 0U ? g_stableState : rawState;
+    uint32_t contextAgeMs = 0U;
+    uint32_t elapsed11Ms = 0U;
+
+    if (g_rightStoplinePreviousRawValid == 0U) {
+        g_rightStoplinePreviousRawValid = 1U;
+        g_rightStoplinePreviousRawState = rawState;
+    }
+
+    if (g_rightStoplineObserverState == RIGHT_STOPLINE_OBSERVER_CONTEXT ||
+        g_rightStoplineObserverState == RIGHT_STOPLINE_OBSERVER_IN_11) {
+        contextAgeMs = AppTicksToMs(now - g_rightStoplineContextLastTick);
+    }
+
+    switch (g_rightStoplineObserverState) {
+        case RIGHT_STOPLINE_OBSERVER_IDLE:
+            if (rawState == 0x01U ||
+                (rawState != 0x03U &&
+                 (stableState == 0x01U || RightStoplineActionIsRight() != 0U))) {
+                g_rightStoplineContextLastTick = now;
+                g_rightStoplineObserverState = RIGHT_STOPLINE_OBSERVER_CONTEXT;
+                g_lineLiveRightStopState = "RIGHT_CONTEXT";
+                g_lineLiveRightStopContextAgeMs = 0U;
+            }
+            break;
+
+        case RIGHT_STOPLINE_OBSERVER_CONTEXT:
+            if (rawState == 0x01U ||
+                (rawState != 0x03U &&
+                 (stableState == 0x01U || RightStoplineActionIsRight() != 0U))) {
+                g_rightStoplineContextLastTick = now;
+                contextAgeMs = 0U;
+            }
+            g_lineLiveRightStopContextAgeMs = contextAgeMs;
+            if (rawState == 0x03U && g_rightStoplinePreviousRawState != 0x03U &&
+                contextAgeMs <= RIGHT_STOPLINE_CONTEXT_MAX_AGE_MS) {
+                g_rightStoplineEnter11Tick = now;
+                g_lineLiveRightStopEntryCount++;
+                g_lineLiveRightStop11Ms = 0U;
+                g_lineLiveRightStopState = "IN_11";
+                g_rightStoplineObserverState = RIGHT_STOPLINE_OBSERVER_IN_11;
+            } else if (contextAgeMs > RIGHT_STOPLINE_CONTEXT_MAX_AGE_MS) {
+                g_lineLiveRightStopState = "IDLE";
+                g_lineLiveRightStopContextAgeMs = 0U;
+                g_rightStoplineObserverState = RIGHT_STOPLINE_OBSERVER_IDLE;
+            }
+            break;
+
+        case RIGHT_STOPLINE_OBSERVER_IN_11:
+            elapsed11Ms = AppTicksToMs(now - g_rightStoplineEnter11Tick);
+            g_lineLiveRightStop11Ms = elapsed11Ms;
+            g_lineLiveRightStopContextAgeMs = AppTicksToMs(now - g_rightStoplineContextLastTick);
+            if (rawState != 0x03U) {
+                RightStoplineRawText(rawState, g_lineLiveRightStopLastExitRaw);
+                g_lineLiveRightStopLast11Ms = elapsed11Ms;
+                g_lineLiveRightStop11Ms = 0U;
+                g_lineLiveRightStopCandidateCount++;
+                g_lineLiveRightStopState = "COOLDOWN";
+                g_rightStoplineCooldownStartTick = now;
+                g_rightStoplineObserverState = RIGHT_STOPLINE_OBSERVER_COOLDOWN;
+            }
+            break;
+
+        case RIGHT_STOPLINE_OBSERVER_COOLDOWN:
+            g_lineLiveRightStopContextAgeMs = 0U;
+            g_lineLiveRightStop11Ms = 0U;
+            if (AppTicksToMs(now - g_rightStoplineCooldownStartTick) >=
+                RIGHT_STOPLINE_COOLDOWN_MS) {
+                g_lineLiveRightStopState = "IDLE";
+                g_rightStoplineObserverState = RIGHT_STOPLINE_OBSERVER_IDLE;
+            }
+            break;
+
+        default:
+            RightStoplineCandidateObserverReset();
+            break;
+    }
+
+    g_rightStoplinePreviousRawState = rawState;
+}
+
+/* Test-only first/second raw-11 classifier; it never changes TRACE itself. */
+typedef enum {
+    DOUBLE_STOP_OBSERVER_WAIT_FIRST = 0,
+    DOUBLE_STOP_OBSERVER_IN_FIRST,
+    DOUBLE_STOP_OBSERVER_WAIT_POSTLINE_FWD,
+    DOUBLE_STOP_OBSERVER_PROBE_SECOND,
+    DOUBLE_STOP_OBSERVER_SINGLE_RETURN,
+    DOUBLE_STOP_OBSERVER_DOUBLE_STOP
+} DoubleStopObserverState;
+
+static DoubleStopObserverState g_doubleStopObserverState;
+static uint8_t g_doubleStopPreviousRawValid;
+static uint8_t g_doubleStopPreviousRawState;
+static int32_t g_doubleStopFirstEnterLeft;
+static int32_t g_doubleStopFirstEnterRight;
+static uint32_t g_doubleStopFirstEnterMs;
+static uint32_t g_doubleStopFirstExitMs;
+static int32_t g_doubleStopProbeStartLeft;
+static int32_t g_doubleStopProbeStartRight;
+static uint32_t g_doubleStopProbeStartMs;
+
+static void DoubleStopAutoReturnObserverReset(void)
+{
+    g_doubleStopObserverState = DOUBLE_STOP_OBSERVER_WAIT_FIRST;
+    g_doubleStopPreviousRawValid = 0U;
+    g_doubleStopPreviousRawState = 0U;
+    g_doubleStopFirstEnterLeft = 0;
+    g_doubleStopFirstEnterRight = 0;
+    g_doubleStopFirstEnterMs = 0U;
+    g_doubleStopFirstExitMs = 0U;
+    g_doubleStopProbeStartLeft = 0;
+    g_doubleStopProbeStartRight = 0;
+    g_doubleStopProbeStartMs = 0U;
+    g_lineLiveStopClassState = "WAIT_FIRST";
+    g_lineLiveStopClassFirstCount = 0U;
+    g_lineLiveStopClassSecondCount = 0U;
+    g_lineLiveStopClassSingleCount = 0U;
+    g_lineLiveStopClassDoubleCount = 0U;
+    g_lineLiveStopClassProbeTicks = 0U;
+    g_lineLiveStopClassProbeArmed = 0U;
+    g_lineLiveStopClassLeftBoundaryCount = 0U;
+    g_lineLiveStopClassFirstExitLeft = 0;
+    g_lineLiveStopClassFirstExitRight = 0;
+    g_lineLiveStopClassSecondEnterLeft = 0;
+    g_lineLiveStopClassSecondEnterRight = 0;
+    g_lineLiveStopClassDecision = "NONE";
+    g_doubleStopTestReturnActive = 0U;
+}
+
+/* Deactivate edge processing at lifecycle end while retaining sticky results. */
+static void DoubleStopAutoReturnObserverDeactivate(void)
+{
+    g_doubleStopObserverState = DOUBLE_STOP_OBSERVER_DOUBLE_STOP;
+    g_doubleStopPreviousRawValid = 0U;
+    g_doubleStopTestReturnActive = 0U;
+    if (g_lineLiveStopClassDecision[0] == 'N') {
+        g_lineLiveStopClassState = "STOPPED";
+    }
+}
+
+typedef enum {
+    DOUBLE_STOP_ACTION_NONE = 0,
+    DOUBLE_STOP_ACTION_BEGIN_RETURN,
+    DOUBLE_STOP_ACTION_FINAL_STOP
+} DoubleStopObserverAction;
+
+/* The caller invokes this with the same fresh raw snapshot used by TRACE. */
+static DoubleStopObserverAction DoubleStopAutoReturnObserverObserve(
+    uint32_t now, WifiIotGpioValue rawLeft, WifiIotGpioValue rawRight,
+    uint8_t stableState, TraceAction action)
+{
+    UdpEncoderTelemetryState encoder;
+    uint8_t rawState = (uint8_t)((rawLeft == WIFI_IOT_GPIO_VALUE1 ? 2U : 0U) |
+                                 (rawRight == WIFI_IOT_GPIO_VALUE1 ? 1U : 0U));
+    uint8_t entered11;
+    int32_t deltaLeft;
+    int32_t deltaRight;
+
+    UdpTelemetryReadEncoder(&encoder);
+
+    if (g_doubleStopPreviousRawValid == 0U) {
+        g_doubleStopPreviousRawValid = 1U;
+        g_doubleStopPreviousRawState = rawState;
+        return DOUBLE_STOP_ACTION_NONE;
+    }
+
+    entered11 = rawState == 0x03U && g_doubleStopPreviousRawState != 0x03U;
+    switch (g_doubleStopObserverState) {
+        case DOUBLE_STOP_OBSERVER_WAIT_FIRST:
+            if (entered11 != 0U) {
+                g_lineLiveStopClassFirstCount++;
+                g_doubleStopFirstEnterLeft = encoder.totalLeft;
+                g_doubleStopFirstEnterRight = encoder.totalRight;
+                g_doubleStopFirstEnterMs = AppTicksToMs(now);
+                g_lineLiveStopClassState = "IN_FIRST";
+                g_doubleStopObserverState = DOUBLE_STOP_OBSERVER_IN_FIRST;
+            }
+            break;
+
+        case DOUBLE_STOP_OBSERVER_IN_FIRST:
+            if (rawState != 0x03U) {
+                g_lineLiveStopClassFirstExitLeft = encoder.totalLeft;
+                g_lineLiveStopClassFirstExitRight = encoder.totalRight;
+                g_doubleStopFirstExitMs = AppTicksToMs(now);
+                g_lineLiveStopClassProbeTicks = 0U;
+                g_lineLiveStopClassProbeArmed = 0U;
+                g_lineLiveStopClassState = "WAIT_POSTLINE_FWD";
+                g_doubleStopObserverState = DOUBLE_STOP_OBSERVER_WAIT_POSTLINE_FWD;
+            }
+            break;
+
+        case DOUBLE_STOP_OBSERVER_WAIT_POSTLINE_FWD:
+            /* Ignore post-crossbar LEFT_MIN/RIGHT_MIN until actual FWD resumes. */
+            if (rawState != 0x03U && action == TRACE_ACTION_FORWARD) {
+                g_doubleStopProbeStartLeft = encoder.totalLeft;
+                g_doubleStopProbeStartRight = encoder.totalRight;
+                g_doubleStopProbeStartMs = AppTicksToMs(now);
+                g_lineLiveStopClassProbeTicks = 0U;
+                g_lineLiveStopClassProbeArmed = 1U;
+                g_lineLiveStopClassState = "PROBE_SECOND";
+                g_doubleStopObserverState = DOUBLE_STOP_OBSERVER_PROBE_SECOND;
+            }
+            break;
+
+        case DOUBLE_STOP_OBSERVER_PROBE_SECOND:
+            deltaLeft = encoder.totalLeft - g_doubleStopProbeStartLeft;
+            deltaRight = encoder.totalRight - g_doubleStopProbeStartRight;
+            if (deltaLeft < 0) deltaLeft = -deltaLeft;
+            if (deltaRight < 0) deltaRight = -deltaRight;
+            g_lineLiveStopClassProbeTicks =
+                ((uint32_t)deltaLeft + (uint32_t)deltaRight) / 2U;
+            if (entered11 != 0U) {
+                g_lineLiveStopClassSecondCount++;
+                g_lineLiveStopClassSecondEnterLeft = encoder.totalLeft;
+                g_lineLiveStopClassSecondEnterRight = encoder.totalRight;
+                g_lineLiveStopClassDoubleCount++;
+                g_lineLiveStopClassDecision = "DOUBLE_STOP";
+                g_lineLiveStopClassState = "DOUBLE_STOP";
+                g_doubleStopObserverState = DOUBLE_STOP_OBSERVER_DOUBLE_STOP;
+                g_doubleStopPreviousRawState = rawState;
+                return DOUBLE_STOP_ACTION_FINAL_STOP;
+            }
+#if (SECOND_STOP_LOOKAHEAD_TICKS > 0U)
+            else if (g_lineLiveStopClassProbeTicks >= SECOND_STOP_LOOKAHEAD_TICKS) {
+                g_lineLiveStopClassSingleCount++;
+                g_lineLiveStopClassDecision = "SINGLE_RETURN";
+                g_lineLiveStopClassState = "SINGLE_RETURN";
+                g_doubleStopObserverState = DOUBLE_STOP_OBSERVER_SINGLE_RETURN;
+                return DOUBLE_STOP_ACTION_BEGIN_RETURN;
+            }
+#endif
+#if (PROVISIONAL_ROUTE_BOUNDARY_TEST_MODE == 1)
+            /* A stable 10 plus actual LEFT is the next route segment, not LEFT_MIN. */
+            if (stableState == 0x02U && action == TRACE_ACTION_LEFT) {
+                g_lineLiveStopClassLeftBoundaryCount++;
+                g_lineLiveStopClassSingleCount++;
+                g_lineLiveStopClassDecision = "SINGLE_RETURN";
+                g_lineLiveStopClassState = "SINGLE_RETURN";
+                g_doubleStopObserverState = DOUBLE_STOP_OBSERVER_SINGLE_RETURN;
+                return DOUBLE_STOP_ACTION_BEGIN_RETURN;
+            }
+#endif
+            break;
+
+        case DOUBLE_STOP_OBSERVER_SINGLE_RETURN:
+        case DOUBLE_STOP_OBSERVER_DOUBLE_STOP:
+            break;
+
+        default:
+            DoubleStopAutoReturnObserverReset();
+            break;
+    }
+
+    g_doubleStopPreviousRawState = rawState;
+    return DOUBLE_STOP_ACTION_NONE;
+}
+
+/*
+ * Passive crossbar pulse observer.  It deliberately owns no TRACE state and
+ * never submits a motor or BPATH command: the event is diagnostic-only.
+ */
+typedef enum {
+    CROSSBAR_OBSERVER_IDLE = 0,
+    CROSSBAR_OBSERVER_CANDIDATE,
+    CROSSBAR_OBSERVER_COOLDOWN
+} CrossbarObserverState;
+
+static CrossbarObserverState g_crossbarObserverState;
+static uint8_t g_crossbarStraightArmed;
+static uint8_t g_crossbarCooldownClearSeen;
+static uint32_t g_crossbarLastNonFwdTick;
+static uint32_t g_crossbarCandidateStartTick;
+static uint32_t g_crossbarCooldownStartTick;
+static uint32_t g_crossbarCandidatePreFwdMs;
+static int32_t g_crossbarCandidateEncoderLeft;
+static int32_t g_crossbarCandidateEncoderRight;
+static uint32_t g_crossbarSequence;
+static uint8_t g_crossbarReject11Active;
+
+static int32_t CrossbarAbs(int32_t value)
+{
+    return value < 0 ? -value : value;
+}
+
+static void CrossbarStateText(uint8_t state, char text[3])
+{
+    text[0] = (state & 0x02U) != 0U ? '1' : '0';
+    text[1] = (state & 0x01U) != 0U ? '1' : '0';
+    text[2] = '\0';
+}
+
+static void CrossbarObserverCancel(uint32_t now, const char *reason)
+{
+    char text[176];
+
+    if (g_crossbarObserverState == CROSSBAR_OBSERVER_CANDIDATE) {
+        g_crossbarSequence++;
+        (void)snprintf(text, sizeof(text),
+            "CROSSBAR_OBS event=CANDIDATE_CANCEL seq=%u reason=%s black_ms=%u",
+            (unsigned int)g_crossbarSequence, reason,
+            (unsigned int)AppTicksToMs(now - g_crossbarCandidateStartTick));
+        (void)UdpTelemetryQueueExperimentText(text);
+    }
+    g_crossbarObserverState = CROSSBAR_OBSERVER_IDLE;
+    g_crossbarStraightArmed = 0U;
+    g_crossbarLastNonFwdTick = now;
+}
+
+static void CrossbarObserverStop(uint32_t now, const char *reason)
+{
+    CrossbarObserverCancel(now, reason);
+    g_crossbarObserverState = CROSSBAR_OBSERVER_IDLE;
+    g_crossbarStraightArmed = 0U;
+    g_crossbarCooldownClearSeen = 0U;
+    g_crossbarLastNonFwdTick = now;
+    g_crossbarCandidateStartTick = 0U;
+    g_crossbarCooldownStartTick = 0U;
+    g_crossbarCandidatePreFwdMs = 0U;
+    g_crossbarCandidateEncoderLeft = 0;
+    g_crossbarCandidateEncoderRight = 0;
+    g_crossbarReject11Active = 0U;
+}
+
+static void CrossbarObserverBeginCandidate(uint32_t now, uint8_t rawState,
+                                            uint8_t stableState)
+{
+    UdpEncoderTelemetryState encoder;
+    char stableText[3];
+    char text[200];
+
+    UdpTelemetryReadEncoder(&encoder);
+    g_crossbarObserverState = CROSSBAR_OBSERVER_CANDIDATE;
+    g_crossbarCandidateStartTick = now;
+    g_crossbarCandidatePreFwdMs = AppTicksToMs(now - g_crossbarLastNonFwdTick);
+    g_crossbarCandidateEncoderLeft = encoder.totalLeft;
+    g_crossbarCandidateEncoderRight = encoder.totalRight;
+    CrossbarStateText(stableState, stableText);
+    g_crossbarSequence++;
+    (void)snprintf(text, sizeof(text),
+        "CROSSBAR_OBS event=CANDIDATE_ENTER seq=%u raw=%u%u stable=%s pre_fwd_ms=%u",
+        (unsigned int)g_crossbarSequence, (unsigned int)((rawState >> 1) & 0x01U),
+        (unsigned int)(rawState & 0x01U), stableText,
+        (unsigned int)g_crossbarCandidatePreFwdMs);
+    (void)UdpTelemetryQueueExperimentText(text);
+}
+
+static void CrossbarObserverConfirm(uint32_t now, uint8_t exitRawState)
+{
+    UdpEncoderTelemetryState encoder;
+    int32_t deltaLeft;
+    int32_t deltaRight;
+    int32_t widthTicks;
+    char text[224];
+
+    UdpTelemetryReadEncoder(&encoder);
+    deltaLeft = encoder.totalLeft - g_crossbarCandidateEncoderLeft;
+    deltaRight = encoder.totalRight - g_crossbarCandidateEncoderRight;
+    widthTicks = (CrossbarAbs(deltaLeft) + CrossbarAbs(deltaRight)) / 2;
+    g_crossbarSequence++;
+    (void)snprintf(text, sizeof(text),
+        "CROSSBAR_EVENT seq=%u black_ms=%u width_ticks=%ld delta_l=%ld delta_r=%ld enter_raw=11 exit_raw=%u%u pre_fwd_ms=%u",
+        (unsigned int)g_crossbarSequence,
+        (unsigned int)AppTicksToMs(now - g_crossbarCandidateStartTick),
+        (long)widthTicks, (long)deltaLeft, (long)deltaRight,
+        (unsigned int)((exitRawState >> 1) & 0x01U), (unsigned int)(exitRawState & 0x01U),
+        (unsigned int)g_crossbarCandidatePreFwdMs);
+    (void)UdpTelemetryQueueExperimentText(text);
+    g_crossbarObserverState = CROSSBAR_OBSERVER_COOLDOWN;
+    g_crossbarCooldownStartTick = now;
+    g_crossbarCooldownClearSeen = 1U;
+}
+
+static void CrossbarObserverReject11(uint32_t now, uint8_t rawState,
+                                     uint8_t stableState, const char *reason)
+{
+    char stableText[3];
+    char text[216];
+
+    if (g_crossbarReject11Active != 0U) return;
+    g_crossbarReject11Active = 1U;
+    CrossbarStateText(stableState, stableText);
+    g_crossbarSequence++;
+    (void)snprintf(text, sizeof(text),
+        "CROSSBAR_OBS event=REJECT_11 seq=%u reason=%s raw=%u%u stable=%s action=%s pre_fwd_ms=%u",
+        (unsigned int)g_crossbarSequence, reason,
+        (unsigned int)((rawState >> 1) & 0x01U), (unsigned int)(rawState & 0x01U),
+        stableText, TraceRecordDiagActionName(g_lastAction),
+        (unsigned int)AppTicksToMs(now - g_crossbarLastNonFwdTick));
+    (void)UdpTelemetryQueueExperimentText(text);
+}
+
+static void CrossbarObserverObserveNotTrace(uint32_t now, WifiIotGpioValue rawLeft,
+                                             WifiIotGpioValue rawRight)
+{
+    uint8_t rawState = (uint8_t)((rawLeft == WIFI_IOT_GPIO_VALUE1 ? 2U : 0U) |
+                                 (rawRight == WIFI_IOT_GPIO_VALUE1 ? 1U : 0U));
+    uint8_t stableState = g_stableStateValid != 0U ? g_stableState : rawState;
+
+    if (rawState == 0x03U) {
+        CrossbarObserverReject11(now, rawState, stableState, "NOT_TRACE");
+    } else {
+        g_crossbarReject11Active = 0U;
+    }
+}
+
+static void CrossbarObserverObserve(uint32_t now, WifiIotGpioValue rawLeft,
+                                    WifiIotGpioValue rawRight)
+{
+    uint8_t rawState = (uint8_t)((rawLeft == WIFI_IOT_GPIO_VALUE1 ? 2U : 0U) |
+                                 (rawRight == WIFI_IOT_GPIO_VALUE1 ? 1U : 0U));
+    uint8_t stableState = g_stableStateValid != 0U ? g_stableState : rawState;
+    uint8_t blackPresent = rawState == 0x03U || stableState == 0x03U;
+    uint32_t blackMs;
+
+    if (rawState != 0x03U) g_crossbarReject11Active = 0U;
+    if (g_crossbarObserverState == CROSSBAR_OBSERVER_COOLDOWN) {
+        if (rawState == 0x03U) {
+            CrossbarObserverReject11(now, rawState, stableState, "COOLDOWN");
+        }
+        if (blackPresent == 0U) g_crossbarCooldownClearSeen = 1U;
+        if (g_crossbarCooldownClearSeen != 0U &&
+            AppTicksToMs(now - g_crossbarCooldownStartTick) >= CROSSBAR_COOLDOWN_MS) {
+            g_crossbarObserverState = CROSSBAR_OBSERVER_IDLE;
+            g_crossbarStraightArmed = 0U;
+            g_crossbarLastNonFwdTick = now;
+        }
+        return;
+    }
+
+    if (g_crossbarObserverState == CROSSBAR_OBSERVER_CANDIDATE) {
+        blackMs = AppTicksToMs(now - g_crossbarCandidateStartTick);
+        if (rawState == 0x01U || rawState == 0x02U) {
+            CrossbarObserverCancel(now, "DIRECTIONAL_RAW");
+        } else if (blackMs >= CROSSBAR_MAX_EVENT_MS) {
+            CrossbarObserverCancel(now, "MAX_EVENT_MS");
+        } else if (blackPresent == 0U) {
+            if (blackMs >= CROSSBAR_MIN_BLACK_MS) {
+                CrossbarObserverConfirm(now, rawState);
+            } else {
+                CrossbarObserverCancel(now, "BLACK_TOO_SHORT");
+            }
+        }
+        return;
+    }
+
+    /* The candidate is admitted from the preceding FWD-only window. */
+    if (rawState == 0x03U && g_crossbarStraightArmed != 0U) {
+        CrossbarObserverBeginCandidate(now, rawState, stableState);
+        return;
+    }
+    if (rawState == 0x03U) {
+        CrossbarObserverReject11(now, rawState, stableState,
+            g_lastAction != TRACE_ACTION_FORWARD ? "NON_FWD_RECENT" : "NOT_STRAIGHT_ARMED");
+        return;
+    }
+    if (g_lastAction != TRACE_ACTION_FORWARD) {
+        g_crossbarLastNonFwdTick = now;
+        g_crossbarStraightArmed = 0U;
+    } else if (g_crossbarStraightArmed == 0U &&
+               AppTicksToMs(now - g_crossbarLastNonFwdTick) >= CROSSBAR_PRE_FWD_MS) {
+        char text[144];
+
+        g_crossbarStraightArmed = 1U;
+        g_crossbarSequence++;
+        (void)snprintf(text, sizeof(text),
+            "CROSSBAR_OBS event=ARM seq=%u pre_fwd_ms=%u",
+            (unsigned int)g_crossbarSequence,
+            (unsigned int)AppTicksToMs(now - g_crossbarLastNonFwdTick));
+        (void)UdpTelemetryQueueExperimentText(text);
+    }
 }
 
 static void TraceRecordDiagPublish(int rawLeft, int rawRight, uint32_t now)
@@ -5607,6 +6477,9 @@ static void CarControlTask(void *argument)
 #endif
 #if (ENCODER_BPATH_FOLLOW_V1_TEST_MODE == 1) && (LINE_SENSOR_SIDE_TEST_MODE == 0)
         BpathControlConsumeCommand(now);
+        if (g_bpathControlState != BPATH_CONTROL_TRACE_RECORD) {
+            CrossbarObserverObserveNotTrace(now, lineLiveRawLeft, lineLiveRawRight);
+        }
         if (g_bpathControlState == BPATH_CONTROL_DISARMED ||
             g_bpathControlState == BPATH_CONTROL_DONE) {
             EncoderExperimentSendMotorCommand(0, 0, now);
@@ -6104,6 +6977,10 @@ static void CarControlTask(void *argument)
             int traceDiagRawLeft = -1;
             int traceDiagRawRight = -1;
             if (lineLiveSensorValid == 0) {
+                CrossbarObserverStop(now, "SENSOR_READ_FAILURE");
+                Long11ObserverReset();
+                RightStoplineCandidateObserverReset();
+                DoubleStopAutoReturnObserverReset();
                 TraceResetDebounce();
                 TraceApplyAction(TRACE_ACTION_STOP);
                 LineLiveSetControl("TRACE", "STOP", 0, 0);
@@ -6117,6 +6994,7 @@ static void CarControlTask(void *argument)
                 sensorReadFailed = 0;
                 WifiIotGpioValue rawLeft = left;
                 WifiIotGpioValue rawRight = right;
+                DoubleStopObserverAction doubleStopAction = DOUBLE_STOP_ACTION_NONE;
                 traceDiagRawLeft = (int)rawLeft;
                 traceDiagRawRight = (int)rawRight;
                 (void)rawLeft; (void)rawRight;
@@ -6174,12 +7052,41 @@ static void CarControlTask(void *argument)
 #endif
                         {
                         AutoReturn11Reset();
+#if (DOUBLE_STOP_AUTO_RETURN_TEST_MODE == 1)
+                        /* Normal TRACE runs first; classifier only observes this same sample. */
+                        TraceControlStep(rawLeft, rawRight, now);
+                        doubleStopAction = DoubleStopAutoReturnObserverObserve(
+                            now, rawLeft, rawRight, g_stableState, g_lastAction);
+                        if (doubleStopAction == DOUBLE_STOP_ACTION_FINAL_STOP) {
+                            /* A second independent raw-11 is DOUBLE: safe DONE. */
+                            TraceApplyAction(TRACE_ACTION_STOP);
+                            BpathControlFinish();
+                        } else if (doubleStopAction == DOUBLE_STOP_ACTION_BEGIN_RETURN) {
+                            /* Provisional route LEFT boundary found no second raw-11. */
+                            TraceApplyAction(TRACE_ACTION_STOP);
+                            g_doubleStopReturnAuthorized = 1U;
+                            g_doubleStopTestReturnActive = 1U;
+                            g_returnTrigger = "STOPLINE_TEST_SINGLE";
+                            if (BpathControlBeginReturn(now) == 0) {
+                                TraceLivePublishManualReturnTrigger(now, g_returnTrigger);
+                            }
+                        } else
+#endif
+                        {
 #if (TRACE_OPEN_LOOP_STRAIGHT_TEST_MODE == 1)
                         TraceOpenLoopStraightStep(traceDiagRawLeft, traceDiagRawRight, now);
 #else
+#if (DOUBLE_STOP_AUTO_RETURN_TEST_MODE == 0)
                         TraceControlStep(rawLeft, rawRight, now);
 #endif
+#endif
                         TraceCurveObserve(now, rawLeft, rawRight);
+                        CrossbarRawForensicsObserve(now, rawLeft, rawRight);
+                        /* Observer-only: it cannot alter TRACE/BPATH motor decisions. */
+                        CrossbarObserverObserve(now, rawLeft, rawRight);
+                        Pre11ContextObserve(now, rawLeft, rawRight);
+                        Long11ObserverObserve(now, rawLeft, rawRight);
+                        RightStoplineCandidateObserverObserve(now, rawLeft, rawRight);
                         /* Snapshot only: socket I/O is owned by UdpTelemetryTask. */
                         TraceUpdateUdpTelemetry();
                         {
@@ -6191,6 +7098,7 @@ static void CarControlTask(void *argument)
                                 TraceRecordDiagActionName(g_lastAction),
                                 g_motorLeftCommand, g_motorRightCommand, "TRACE",
                                 TRACE_LIVE_FORWARD_PERIOD_MS, 0);
+                        }
                         }
                         }
                     }
@@ -6252,7 +7160,8 @@ int TaskCarControlInit(void)
     attr.cb_mem = NULL;
     attr.cb_size = 0;
     attr.stack_mem = NULL;
-    attr.stack_size = 2048;
+    /* RETURN transition can synchronously format multiple forensic records. */
+    attr.stack_size = 4096;
     attr.priority = osPriorityNormal;
 
     if (osThreadNew(CarControlTask, NULL, &attr) == NULL) {
