@@ -18,9 +18,15 @@ int BPathFollowIsFinished(void);
  * enter the existing reverse follower. */
 int BPathExternalRecordStart(uint32_t now);
 int BPathExternalRecordStep(uint32_t now);
+/* Normal TRACE may keep only a compact rolling tail while no fork semantics
+ * need a reversible path.  Disabling it freezes source indices for E1/E2. */
+void BPathExternalSetIdleRolling(uint8_t enabled, const char *reason);
 int BPathExternalRecordFinish(uint32_t now);
 int BPathExternalReturnStart(uint32_t now);
 int BPathExternalReturnSettleComplete(uint32_t now);
+/* Read-only completion reason for safety owners that must not retry after a
+ * reverse follower abort. */
+int BPathExternalReturnAborted(void);
 void BPathExternalRecordStop(uint32_t now);
 /* Lifecycle guards only; they do not select or send motor commands. */
 int BPathExternalHasForwardMovement(void);
@@ -32,6 +38,20 @@ void BPathExternalGetForwardRecordProgress(uint16_t *count, uint16_t *capacity);
 int BPathExternalGetForwardRecordIndex(uint16_t *index);
 /* Read-only cumulative encoder travel stored at one forward source point. */
 int BPathExternalGetForwardPointTravel(uint16_t index, int32_t *left, int32_t *right);
+/* Read-only source/reference bracketing used to diagnose safe reverse marks.
+ * A source index of 0xffff means that side of the bracket is unavailable. */
+typedef struct {
+    uint16_t forwardPoints;
+    uint16_t referencePoints;
+    uint16_t firstReferenceSourceIndex;
+    uint16_t lastReferenceSourceIndex;
+    uint16_t nearestBeforeSourceIndex;
+    uint16_t nearestBeforeReferenceIndex;
+    uint16_t nearestAfterSourceIndex;
+    uint16_t nearestAfterReferenceIndex;
+} BPathReferenceMapDiagnostics;
+int BPathExternalGetReferenceMapDiagnostics(uint16_t sourceIndex,
+                                             BPathReferenceMapDiagnostics *diagnostics);
 int BPathExternalMapForwardIndexToReference(uint16_t forwardIndex, uint16_t *referenceIndex);
 int BPathExternalGetReturnReferenceCursor(uint16_t *referenceIndex);
 

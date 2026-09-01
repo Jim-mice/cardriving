@@ -49,8 +49,11 @@
 #define BPF_PDIFF_WRONG_DIR 20
 #define BPF_RESALIGN_IDLE_MS 1000U
 #define BPF_RESALIGN_TIMEOUT_MS 15000U
-/* Keep complete forward/reverse trajectories; no decimation or ring overwrite. */
 #define BPF_MAX_POINTS 640U
+/* With no unresolved fork, preserve only enough source history for the
+ * pre-E1 extractor (16 lookback + 3 edge skip + margin). */
+#define BPF_IDLE_TAIL_POINTS 32U
+#define BPF_IDLE_COMPACT_TRIGGER_POINTS 64U
 
 typedef enum { BPF_WAIT = 0, BPF_ARM, BPF_FORWARD_A, BPF_FORWARD_B,
                BPF_FORWARD_SETTLE, BPF_REVERSE_PAUSE, BPF_REVERSE,
@@ -172,6 +175,8 @@ static int32_t g_resLastRawL, g_resLastRawR, g_resLastLogDl, g_resLastLogDr;
 static uint8_t g_resMovementStarted;
 static uint32_t g_externalRecordStopMs;
 static uint8_t g_externalReturnNoPdiff;
+static uint8_t g_externalIdleRolling;
+static uint8_t g_externalIdleRollingEver;
 static char g_text[768];
 
 static int32_t BpfAbs(int32_t value) { return value < 0 ? -value : value; }
@@ -353,6 +358,51 @@ static void BpfPathAdd(BpfPathPoint *path, uint16_t *count, uint8_t *overflow,
     point->pathError = pathError; point->refIndex = referenceIndex;
     point->commandLeft = (int16_t)leftCmd; point->commandRight = (int16_t)rightCmd;
     (*count)++;
+}
+
+/* Rebase the existing single forward array around its newest retained tail.
+ * The stored travel remains real encoder-relative travel, but its new zero is
+ * the first retained source point so later appends and BPATH reference build
+ * remain internally consistent.  This is called only while no E1/candidate
+ * can refer to a forward source index. */
+static void BpfCompactIdleForwardTail(void)
+{
+    uint16_t keep = BPF_IDLE_TAIL_POINTS;
+    uint16_t start;
+    uint16_t index;
+    int32_t baseLeft;
+    int32_t baseRight;
+    uint32_t baseTime;
+    uint16_t before = g_forwardCount;
+
+    if (g_forwardCount <= BPF_IDLE_COMPACT_TRIGGER_POINTS) {
+        return;
+    }
+    if (keep > g_forwardCount) {
+        keep = g_forwardCount;
+    }
+    start = (uint16_t)(g_forwardCount - keep);
+    baseLeft = g_forwardPath[start].left;
+    baseRight = g_forwardPath[start].right;
+    baseTime = g_forwardPath[start].timeMs;
+    for (index = 0U; index < keep; index++) {
+        g_forwardPath[index] = g_forwardPath[(uint16_t)(start + index)];
+        g_forwardPath[index].index = index;
+        g_forwardPath[index].timeMs -= baseTime;
+        g_forwardPath[index].left -= baseLeft;
+        g_forwardPath[index].right -= baseRight;
+    }
+    g_forwardCount = keep;
+    g_result.fStartL += baseLeft;
+    g_result.fStartR += baseRight;
+    g_result.boundaryL = g_result.fStartL;
+    g_result.boundaryR = g_result.fStartR;
+    g_forwardPathStartMs += baseTime;
+    g_forwardOverflow = 0U;
+    (void)snprintf(g_text, sizeof(g_text),
+                   "BPATH event=IDLE_COMPACT before=%u after=%u",
+                   (unsigned int)before, (unsigned int)keep);
+    BpfPublish(g_text);
 }
 
 static void BpfStartForwardPath(const UdpEncoderTelemetryState *encoder, uint32_t ms)
@@ -653,6 +703,8 @@ void BPathFollowInit(void)
     g_resMovementStarted = 0U;
     g_externalRecordStopMs = 0U;
     g_externalReturnNoPdiff = 0U;
+    g_externalIdleRolling = 0U;
+    g_externalIdleRollingEver = 0U;
     g_terminalFrozenLeft = g_terminalFrozenRight = 0;
     BpfPublish("BOOT"); BpfPublish("WAIT_ENCODER");
 }
@@ -660,6 +712,11 @@ void BPathFollowInit(void)
 int BPathFollowIsFinished(void)
 {
     return g_state == BPF_DONE || g_state == BPF_ABORT;
+}
+
+int BPathExternalReturnAborted(void)
+{
+    return g_state == BPF_ABORT;
 }
 
 int BPathExternalRecordStart(uint32_t now)
@@ -678,12 +735,38 @@ int BPathExternalRecordStart(uint32_t now)
     g_result.fStartFrames = encoder.validCount;
     g_forwardCount = 0U;
     g_forwardOverflow = 0U;
+    g_externalIdleRolling = 0U;
+    g_externalIdleRollingEver = 0U;
     g_forwardLastValid = encoder.validCount;
     g_forwardPathStartMs = ms;
     BpfPathAdd(g_forwardPath, &g_forwardCount, &g_forwardOverflow, BPF_FWD_ACTIVE,
                encoder.sequence, 0U, 0, 0, 0, 0, 0, 0U, 0, 0);
     BpfPublish("TRACE_RECORD_START");
     return 0;
+}
+
+void BPathExternalSetIdleRolling(uint8_t enabled, const char *reason)
+{
+    uint8_t next = enabled != 0U ? 1U : 0U;
+
+    if (next == g_externalIdleRolling) {
+        return;
+    }
+    g_externalIdleRolling = next;
+    if (next != 0U) {
+        (void)snprintf(g_text, sizeof(g_text),
+                       "BPATH event=IDLE_ROLL_%s keep_points=%u reason=%s",
+                       g_externalIdleRollingEver == 0U ? "START" : "RESUME",
+                       (unsigned int)BPF_IDLE_TAIL_POINTS,
+                       reason == NULL ? "NONE" : reason);
+        g_externalIdleRollingEver = 1U;
+    } else {
+        (void)snprintf(g_text, sizeof(g_text),
+                       "BPATH event=FORK_PRESERVE_START reason=%s points=%u",
+                       reason == NULL ? "NONE" : reason,
+                       (unsigned int)g_forwardCount);
+    }
+    BpfPublish(g_text);
 }
 
 int BPathExternalRecordStep(uint32_t now)
@@ -698,6 +781,9 @@ int BPathExternalRecordStep(uint32_t now)
     }
     if (encoder.validCount == g_forwardLastValid) {
         return 0;
+    }
+    if (g_externalIdleRolling != 0U) {
+        BpfCompactIdleForwardTail();
     }
     g_forwardLastValid = encoder.validCount;
     BpfPathAdd(g_forwardPath, &g_forwardCount, &g_forwardOverflow,
@@ -714,6 +800,7 @@ int BPathExternalRecordStep(uint32_t now)
 
 void BPathExternalRecordStop(uint32_t now)
 {
+    g_externalIdleRolling = 0U;
     g_externalRecordStopMs = AppTicksToMs(now);
     BpfPublish("TRACE_RECORD_STOP");
 }
@@ -757,6 +844,45 @@ int BPathExternalGetForwardPointTravel(uint16_t index, int32_t *left, int32_t *r
     return 0;
 }
 
+int BPathExternalGetReferenceMapDiagnostics(uint16_t sourceIndex,
+                                             BPathReferenceMapDiagnostics *diagnostics)
+{
+    uint16_t index;
+
+    if (diagnostics == NULL) {
+        return -1;
+    }
+    diagnostics->forwardPoints = g_forwardCount;
+    diagnostics->referencePoints = g_referenceCount;
+    diagnostics->firstReferenceSourceIndex = 0xffffU;
+    diagnostics->lastReferenceSourceIndex = 0xffffU;
+    diagnostics->nearestBeforeSourceIndex = 0xffffU;
+    diagnostics->nearestBeforeReferenceIndex = 0xffffU;
+    diagnostics->nearestAfterSourceIndex = 0xffffU;
+    diagnostics->nearestAfterReferenceIndex = 0xffffU;
+    if (sourceIndex >= g_forwardCount || g_referenceCount == 0U) {
+        return -1;
+    }
+    diagnostics->firstReferenceSourceIndex = g_referenceForwardIndex[0U];
+    diagnostics->lastReferenceSourceIndex =
+        g_referenceForwardIndex[g_referenceCount - 1U];
+    /* Sources descend as reverse reference indexes ascend.  "Before" is the
+     * safe, already-passed side of a forward spatial mark. */
+    for (index = 0U; index < g_referenceCount; index++) {
+        uint16_t referenceSource = g_referenceForwardIndex[index];
+        if (referenceSource <= sourceIndex &&
+            diagnostics->nearestBeforeReferenceIndex == 0xffffU) {
+            diagnostics->nearestBeforeSourceIndex = referenceSource;
+            diagnostics->nearestBeforeReferenceIndex = index;
+        }
+        if (referenceSource > sourceIndex) {
+            diagnostics->nearestAfterSourceIndex = referenceSource;
+            diagnostics->nearestAfterReferenceIndex = index;
+        }
+    }
+    return 0;
+}
+
 int BPathExternalMapForwardIndexToReference(uint16_t forwardIndex, uint16_t *referenceIndex)
 {
     uint16_t index;
@@ -770,6 +896,17 @@ int BPathExternalMapForwardIndexToReference(uint16_t forwardIndex, uint16_t *ref
             *referenceIndex = index;
             return 0;
         }
+    }
+    /* BpfBuildReference intentionally coalesces repeated zero-travel source
+     * samples.  If that removes source 0, the final reference is still the
+     * physical path origin and is the only safe clamp for sample backoff. */
+    if (forwardIndex == 0U &&
+        g_forwardPath[g_referenceForwardIndex[g_referenceCount - 1U]].left ==
+            g_forwardPath[0U].left &&
+        g_forwardPath[g_referenceForwardIndex[g_referenceCount - 1U]].right ==
+            g_forwardPath[0U].right) {
+        *referenceIndex = g_referenceCount - 1U;
+        return 0;
     }
     return -1;
 }
