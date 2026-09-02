@@ -18,7 +18,7 @@
 #define UDP_TELEMETRY_SEND_ERROR_LOG_MS 5000U
 #define UDP_TELEMETRY_THREAD_STACK_SIZE 4096U
 #define UDP_COMMAND_THREAD_STACK_SIZE 2048U
-#define UDP_COMMAND_RX_BUFFER_SIZE 32U
+#define UDP_COMMAND_RX_BUFFER_SIZE 160U
 #define UDP_COMMAND_RECV_TIMEOUT_MS 200U
 #define UDP_TELEMETRY_TEXT_BUFFER_SIZE 1536U
 #define UDP_REPLAY_EVENT_QUEUE_CAPACITY 16U
@@ -662,12 +662,39 @@ static int UdpCommandCreateSocket(void)
 static const char *UdpCommandHandlePayload(const char *payload, int length,
                                            const struct sockaddr_in *sender)
 {
+    char rcLine[UDP_COMMAND_RX_BUFFER_SIZE];
+    RemoteControlState remote;
+    unsigned int seq, admin, ge, le, re, ae;
+    int gear, steer;
     if (length > 0 && payload[length - 1] == '\r') {
         length--;
     } else if (length > 0 && payload[length - 1] == '\n') {
         length--;
         if (length > 0 && payload[length - 1] == '\r') {
             length--;
+        }
+    }
+
+    if (length > 0 && length < (int)sizeof(rcLine)) {
+        (void)memcpy(rcLine, payload, (size_t)length);
+        rcLine[length] = '\0';
+    } else {
+        rcLine[0] = '\0';
+    }
+
+    if (length > 4 && sscanf(rcLine, "RC1 seq=%u gear=%d steer=%d admin=%u ge=%u le=%u re=%u ae=%u",
+                             &seq, &gear, &steer, &admin, &ge, &le, &re, &ae) == 8) {
+        if (gear >= -3 && gear <= 3 && steer >= -1 && steer <= 1 && admin <= 1U) {
+            remote.gear = (int8_t)gear;
+            remote.steer = (int8_t)steer;
+            remote.adminStop = (uint8_t)admin;
+            remote.sequence = seq;
+            remote.gearEvent = ge;
+            remote.leftEvent = le;
+            remote.rightEvent = re;
+            remote.adminEvent = ae;
+            CarControlSubmitRemoteState(&remote);
+            return "OK RC1";
         }
     }
 

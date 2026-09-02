@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "cmsis_os2.h"
 #include "hi_time.h"
@@ -258,6 +259,7 @@
 
 extern void car_stop(void);
 extern void stm32motor_control(int motorA, int motorB);
+static void EncoderExperimentSendMotorCommand(int leftCommand, int rightCommand, uint32_t now);
 
 static volatile CarMode g_carMode = CAR_MODE_IDLE;
 static int g_carControlTaskStarted;
@@ -1315,6 +1317,61 @@ static TraceAction g_lastAction = TRACE_ACTION_STOP;
 static int g_motorLeftCommand;
 static int g_motorRightCommand;
 static int g_motorCommandValid;
+static volatile RemoteControlState g_remoteState = {0, 0, 0, 0, 0, 0, 0, 0};
+static RemoteControlState g_remoteApplied = {0, 0, 0, 0, 0, 0, 0, 0};
+static uint8_t g_remoteLightColor;
+
+static void RemoteLightEvent(uint8_t event)
+{
+    uint8_t frame[6] = {0xFCU, 0xFEU, event, g_remoteLightColor++, 0U, 0xFDU};
+    (void)UartWrite(WIFI_IOT_UART_IDX_2, frame, sizeof(frame));
+}
+
+void CarControlSubmitRemoteState(const RemoteControlState *state)
+{
+    if (state != NULL) {
+        g_remoteState = *state;
+    }
+}
+
+static void RemoteControlStep(uint32_t now)
+{
+    RemoteControlState state = g_remoteState;
+    int base = 0;
+    int signedBase;
+    int delta;
+    int left;
+    int right;
+
+    if (state.gear > 0) base = (state.gear == 1) ? 80 : (state.gear == 2) ? 100 : 150;
+    else if (state.gear < 0) base = (state.gear == -1) ? 80 : (state.gear == -2) ? 100 : 150;
+    signedBase = state.gear < 0 ? -base : base;
+    left = right = 0;
+    if (state.gear != 0 && state.adminStop == 0U) {
+        delta = base * 20 / 100;
+        left = signedBase;
+        right = signedBase;
+        if (state.steer < 0) { left = signedBase - delta; right = signedBase + delta; }
+        else if (state.steer > 0) { left = signedBase + delta; right = signedBase - delta; }
+    }
+    if (left > 150 || left < -150 || right > 150 || right < -150) {
+        int peak = abs(left) > abs(right) ? abs(left) : abs(right);
+        left = left * 150 / peak;
+        right = right * 150 / peak;
+    }
+    if (state.gear != g_remoteApplied.gear || state.steer != g_remoteApplied.steer ||
+        state.adminStop != g_remoteApplied.adminStop || g_motorCommandValid == 0) {
+        printf("REMOTE motor gear=%d steer=%d admin=%u L=%d R=%d seq=%u\r\n",
+               (int)state.gear, (int)state.steer, (unsigned int)state.adminStop,
+               left, right, (unsigned int)state.sequence);
+    }
+    EncoderExperimentSendMotorCommand(left, right, now);
+    if (state.gearEvent != g_remoteApplied.gearEvent) RemoteLightEvent(1U);
+    if (state.leftEvent != g_remoteApplied.leftEvent) RemoteLightEvent(2U);
+    if (state.rightEvent != g_remoteApplied.rightEvent) RemoteLightEvent(3U);
+    if (state.adminEvent != g_remoteApplied.adminEvent) RemoteLightEvent(1U);
+    g_remoteApplied = state;
+}
 static uint32_t g_lastMotorTxTick;
 static uint8_t g_motorHeartbeatCount;
 static uint8_t g_stableState;
@@ -9423,7 +9480,7 @@ static void CarControlTask(void *argument)
 #if (ENCODER_SEGMENT_B_PROGRESS_TEST_MODE == 1)
     BProgressInit();
 #endif
-#if (ENCODER_BPATH_FOLLOW_V1_TEST_MODE == 1) && (MOTOR_RESPONSE_TEST_MODE == 0) && \
+#if (HOST_REMOTE_CONTROL_MODE == 0) && (ENCODER_BPATH_FOLLOW_V1_TEST_MODE == 1) && (MOTOR_RESPONSE_TEST_MODE == 0) && \
     (LINE_SENSOR_SIDE_TEST_MODE == 0)
     BpathControlPublish("BPATHCTL event=READY state=DISARMED");
 #if (AUTO_TRACE_BOOT_TEST_MODE == 1)
@@ -9482,6 +9539,13 @@ static void CarControlTask(void *argument)
         WifiIotGpioValue lineLiveRawRight = WIFI_IOT_GPIO_VALUE0;
         int lineLiveSensorValid = LineSensorRead(&lineLiveRawLeft, &lineLiveRawRight);
         uint8_t forkTestClaimedThisLoop = 0U;
+
+#if (HOST_REMOTE_CONTROL_MODE == 1)
+        (void)lineLiveSensorValid;
+        RemoteControlStep(now);
+        osDelay(AppMsToTicks(CAR_CONTROL_PERIOD_MS));
+        continue;
+#endif
 
         /* One fresh owner-loop read drives the independent, always-on view. */
         LineLiveUpdateSensor(lineLiveRawLeft, lineLiveRawRight, lineLiveSensorValid);

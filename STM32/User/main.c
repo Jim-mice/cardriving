@@ -1497,6 +1497,11 @@ static void ApplyHi3861MotorFrame(const uint8_t *frame)
     int leftSpeed;
     int rightSpeed;
 
+    if (frame != 0 && frame[0] == USART1_HI3861_FRAME_HEAD && frame[1] == 0xFEU &&
+        frame[5] == USART1_HI3861_FRAME_TAIL) {
+        Light_SetEvent(frame[2], frame[3]);
+        return;
+    }
     if (frame == 0 ||
         frame[0] != USART1_HI3861_FRAME_HEAD ||
         frame[5] != USART1_HI3861_FRAME_TAIL)

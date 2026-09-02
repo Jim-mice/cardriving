@@ -19,7 +19,8 @@
 #define TRACE_OBSERVER_TEST_MODE 0
 
 /* One automatic boot run starts forward TRACE plus recording. */
-#define AUTO_TRACE_BOOT_TEST_MODE 1
+#define AUTO_TRACE_BOOT_TEST_MODE 0
+#define HOST_REMOTE_CONTROL_MODE 1
 /* Disabled during forward TRACE debugging: BPATH RETURN remains manual. */
 #define AUTO_RETURN_ON_11_TEST_MODE 0
 #define AUTO_RETURN_11_CONFIRM_MS 300U
@@ -35,6 +36,17 @@ typedef enum {
     CAR_MODE_TRACE,
     CAR_MODE_AVOID
 } CarMode;
+
+typedef struct {
+    int8_t gear;
+    int8_t steer;
+    uint8_t adminStop;
+    uint32_t sequence;
+    uint32_t gearEvent;
+    uint32_t leftEvent;
+    uint32_t rightEvent;
+    uint32_t adminEvent;
+} RemoteControlState;
 
 /* BLE RX only publishes one of these commands. TaskCarControl consumes it. */
 typedef enum {
@@ -98,5 +110,6 @@ void CarControlSubmitForkTestCommand(ForkTestCommand command);
 int CarControlReverseV8TestModeEnabled(void);
 /* Encoder-only experiments do not use distance scanning or a moving servo. */
 int CarControlEncoderOnlyExperimentModeEnabled(void);
+void CarControlSubmitRemoteState(const RemoteControlState *state);
 
 #endif
