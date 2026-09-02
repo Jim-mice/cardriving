@@ -146,6 +146,11 @@
  */
 #define SECOND_STOP_LOOKAHEAD_TICKS 0U
 #define FORK_BACKOFF_SAMPLES 12U
+/* BpfBuildReference may coalesce only encoder-jitter samples at this scale.
+ * Anything larger is a marker/reference provenance error, never a nearest-map
+ * fallback for the initial TWO_LONG return target. */
+#define AUTOFORK_REFERENCE_MAP_MAX_ENCODER_ERROR 3
+#define REENTRY_LEFT_ESTABLISH_ADVANCES 10U
 #define FORK_SELECT_MAX_MS 1200U
 /* Attended pre-E1 curve replay; isolated from ordinary TRACE semantics. */
 #define REENTRY_CURVE_EDGE_SKIP_SAMPLES 3U
@@ -598,6 +603,14 @@ static uint8_t g_doubleStopReturnAuthorized;
 static uint8_t g_doubleStopTestReturnActive;
 static uint8_t g_manualReturnPipelineActive;
 static uint8_t g_bpathAbortStop;
+/* Optional/pre-commit TRACE history was discarded after an encoder receive
+ * timeout.  It must never mask a fault once a reverse is committed. */
+static uint8_t g_bpathIdleHistoryDegraded;
+/* A pre-commit timeout makes the current E1 return mark unusable.  TRACE may
+ * continue, but a later committed TWO_LONG return must fail safely. */
+static uint8_t g_bpathReturnPathAvailable;
+/* Snapshot before the same owner-loop can qualify E1/E2. */
+static uint8_t g_bpathRecordWasPreCommit;
 static const char *g_returnTrigger = "NONE";
 static volatile ForkTestCommand g_forkTestPendingCommand;
 
@@ -642,6 +655,10 @@ typedef struct {
     AutoForkReturnState state;
     uint32_t eventId;
     uint16_t forwardStartIndex;
+    uint32_t forwardSourceSerial;
+    uint32_t forwardEpoch;
+    int32_t captureEncoderLeft;
+    int32_t captureEncoderRight;
     uint16_t forwardEndIndex;
     uint16_t markReferenceIndex;
     uint16_t backoffStopReferenceIndex;
@@ -666,6 +683,7 @@ typedef enum {
     REENTRY_TEST_ANCHOR_SETTLE,
     REENTRY_TEST_READY,
     REENTRY_TEST_REFUSED,
+    REENTRY_TEST_LEFT_ESTABLISH,
     REENTRY_TEST_APPROACH,
     REENTRY_TEST_DEPART,
     REENTRY_TEST_FORCE,
@@ -723,6 +741,7 @@ typedef struct {
     uint8_t historyDataFault;
     uint8_t candidateUsesReplay;
     uint16_t departAdvances;
+    uint8_t leftEstablishmentComplete;
     uint32_t settleStartTick;
     uint32_t settleLastValidCount;
     int32_t settleLastLeft;
@@ -909,6 +928,9 @@ static void BpathControlBeginRun(uint8_t autoBoot, uint8_t externalRouteStart)
     g_doubleStopReturnAuthorized = 0U;
     g_manualReturnPipelineActive = 0U;
     g_bpathAbortStop = 0U;
+    g_bpathIdleHistoryDegraded = 0U;
+    g_bpathReturnPathAvailable = 1U;
+    g_bpathRecordWasPreCommit = 0U;
     g_returnTrigger = "NONE";
     g_bpathControlState = BPATH_CONTROL_TRACE_ARM;
     g_traceLiveLastTick = 0U;
@@ -992,6 +1014,8 @@ static int BpathControlBeginTraceRecord(uint32_t now)
         return -1;
     }
     g_bpathControlState = BPATH_CONTROL_TRACE_RECORD;
+    g_bpathIdleHistoryDegraded = 0U;
+    g_bpathReturnPathAvailable = 1U;
     CrossbarObserverStop(now, "TRACE_INIT");
     CrossbarRawForensicsReset();
     Long11ObserverReset();
@@ -2230,6 +2254,10 @@ typedef struct {
     uint32_t exitMs;
     uint16_t forwardPathStartIndex;
     uint16_t forwardPathEndIndex;
+    uint32_t forwardSourceSerial;
+    uint32_t forwardEpoch;
+    int32_t startEncoderLeft;
+    int32_t startEncoderRight;
     uint8_t preRaw;  /* fresh raw snapshot when stable 11 is entered */
     uint8_t postRaw; /* fresh raw snapshot when stable 11 is exited */
     uint8_t active;
@@ -2256,6 +2284,10 @@ typedef struct {
     uint32_t startTick;
     uint32_t startMs;
     uint16_t startPathIndex;
+    uint32_t startSourceSerial;
+    uint32_t startEpoch;
+    int32_t startEncoderLeft;
+    int32_t startEncoderRight;
     uint8_t startRaw;
     uint8_t active;
     uint8_t qualified;
@@ -2300,6 +2332,10 @@ static void ElevenEventReset(void)
     g_elevenCandidate.startTick = 0U;
     g_elevenCandidate.startMs = 0U;
     g_elevenCandidate.startPathIndex = 0xffffU;
+    g_elevenCandidate.startSourceSerial = 0U;
+    g_elevenCandidate.startEpoch = 0U;
+    g_elevenCandidate.startEncoderLeft = 0;
+    g_elevenCandidate.startEncoderRight = 0;
     g_elevenCandidate.startRaw = 0U;
     g_elevenCandidate.active = 0U;
     g_elevenCandidate.qualified = 0U;
@@ -2358,13 +2394,27 @@ static ElevenEventSignal ElevenEventObserve(uint32_t now, WifiIotGpioValue rawLe
         return ELEVEN_EVENT_SIGNAL_NONE;
     }
     if (stableState == 0x03U && g_elevenEventPreviousStable != 0x03U) {
+        BPathForwardMarker marker;
+        UdpEncoderTelemetryState encoder;
+
         /* Freeze rolling compaction before exposing startPathIndex. */
         BPathExternalSetIdleRolling(0U, "ELEVEN_CANDIDATE");
         g_elevenCandidate.startTick = now;
         g_elevenCandidate.startMs = nowMs;
         g_elevenCandidate.startRaw = rawState;
-        if (BPathExternalGetForwardRecordIndex(&g_elevenCandidate.startPathIndex) != 0) {
+        UdpTelemetryReadEncoder(&encoder);
+        g_elevenCandidate.startEncoderLeft = encoder.totalLeft;
+        g_elevenCandidate.startEncoderRight = encoder.totalRight;
+        if (g_bpathIdleHistoryDegraded != 0U || g_bpathReturnPathAvailable == 0U ||
+            BPathExternalGetForwardRecordMarker(&marker) != 0) {
             g_elevenCandidate.startPathIndex = 0xffffU;
+            g_elevenCandidate.startSourceSerial = 0U;
+            g_elevenCandidate.startEpoch = 0U;
+            printf("BPATH event=FORK_RETURN_UNAVAILABLE reason=PRECOMMIT_ENCODER_HISTORY_INVALID\r\n");
+        } else {
+            g_elevenCandidate.startPathIndex = marker.physicalIndex;
+            g_elevenCandidate.startSourceSerial = marker.sourceSerial;
+            g_elevenCandidate.startEpoch = marker.epoch;
         }
         g_elevenCandidate.active = 1U;
         g_elevenCandidate.qualified = 0U;
@@ -2400,16 +2450,22 @@ static ElevenEventSignal ElevenEventObserve(uint32_t now, WifiIotGpioValue rawLe
             event->valid = 1U;
             event->forwardPathStartIndex = g_elevenCandidate.startPathIndex;
             event->forwardPathEndIndex = 0xffffU;
+            event->forwardSourceSerial = g_elevenCandidate.startSourceSerial;
+            event->forwardEpoch = g_elevenCandidate.startEpoch;
+            event->startEncoderLeft = g_elevenCandidate.startEncoderLeft;
+            event->startEncoderRight = g_elevenCandidate.startEncoderRight;
             if (g_elevenEventHistoryCount < ELEVEN_EVENT_HISTORY_CAPACITY) {
                 g_elevenEventHistoryCount++;
             }
             g_elevenEventOpenSlot = slot;
             g_elevenCandidate.qualified = 1U;
             *eventOut = event;
-            printf("SEQ11EVT event=QUALIFY id=%u start=%u now=%u dwell=%u path_start=%u\r\n",
+            printf("SEQ11EVT event=QUALIFY id=%u start=%u now=%u dwell=%u path_start=%u source_serial=%lu epoch=%lu\r\n",
                    (unsigned int)event->id, (unsigned int)event->enterMs,
                    (unsigned int)nowMs, (unsigned int)dwellMs,
-                   (unsigned int)event->forwardPathStartIndex);
+                   (unsigned int)event->forwardPathStartIndex,
+                   (unsigned long)event->forwardSourceSerial,
+                   (unsigned long)event->forwardEpoch);
             g_elevenEventPreviousStable = stableState;
             ElevenEventSyncLineLive();
             return ELEVEN_EVENT_SIGNAL_ENTER;
@@ -2718,22 +2774,32 @@ static int AutoForkArmTwoLong(const ElevenEvent *firstEvent)
 {
     uint16_t forwardCount;
     uint16_t forwardCapacity;
+    BPathForwardMarker marker;
+    ElevenEvent resolvedEvent;
 
     BPathExternalGetForwardRecordProgress(&forwardCount, &forwardCapacity);
     if (firstEvent == NULL || firstEvent->valid == 0U ||
-        firstEvent->forwardPathStartIndex == 0xffffU ||
-        firstEvent->forwardPathStartIndex >= forwardCount) {
+        firstEvent->forwardSourceSerial == 0U ||
+        BPathExternalGetForwardMarkerBySerial(firstEvent->forwardSourceSerial,
+                                              &marker) != 0 ||
+        marker.epoch != firstEvent->forwardEpoch) {
         g_autoForkReturn.state = AUTO_FORK_FAILED;
-        printf("AUTOFORK event=INVALID_MARK e1=%u start=%u count=%u cap=%u\r\n",
+        printf("AUTOFORK event=INVALID_MARK e1=%u start=%u serial=%lu epoch=%lu count=%u cap=%u\r\n",
                firstEvent == NULL ? 0U : (unsigned int)firstEvent->id,
                firstEvent == NULL ? 0xffffU :
                    (unsigned int)firstEvent->forwardPathStartIndex,
+               firstEvent == NULL ? 0UL : (unsigned long)firstEvent->forwardSourceSerial,
+               firstEvent == NULL ? 0UL : (unsigned long)firstEvent->forwardEpoch,
                (unsigned int)forwardCount, (unsigned int)forwardCapacity);
         return -1;
     }
     g_autoForkReturn.state = AUTO_FORK_ARMED;
     g_autoForkReturn.eventId = firstEvent->id;
-    g_autoForkReturn.forwardStartIndex = firstEvent->forwardPathStartIndex;
+    g_autoForkReturn.forwardStartIndex = marker.physicalIndex;
+    g_autoForkReturn.forwardSourceSerial = firstEvent->forwardSourceSerial;
+    g_autoForkReturn.forwardEpoch = firstEvent->forwardEpoch;
+    g_autoForkReturn.captureEncoderLeft = firstEvent->startEncoderLeft;
+    g_autoForkReturn.captureEncoderRight = firstEvent->startEncoderRight;
     g_autoForkReturn.forwardEndIndex = firstEvent->forwardPathEndIndex;
     g_autoForkReturn.markReferenceIndex = 0U;
     g_autoForkReturn.backoffStopReferenceIndex = 0U;
@@ -2742,7 +2808,18 @@ static int AutoForkArmTwoLong(const ElevenEvent *firstEvent)
     g_autoForkReturn.forwardPointCountAtArm = forwardCount;
     g_autoForkReturn.markReached = 0U;
     g_autoForkReturn.mapFailureReason = "AUTOFORK_REFERENCE_MAP";
-    ReentryCurveLock(firstEvent);
+    resolvedEvent = *firstEvent;
+    resolvedEvent.forwardPathStartIndex = marker.physicalIndex;
+    ReentryCurveLock(&resolvedEvent);
+    printf("AUTOFORKMARK event=E1_CAPTURE id=%u enter_ms=%u enc_l=%ld enc_r=%ld "
+           "source_serial=%lu physical_index=%u epoch=%lu record_count=%u "
+           "marker_enc_l=%ld marker_enc_r=%ld\r\n",
+           (unsigned int)firstEvent->id, (unsigned int)firstEvent->enterMs,
+           (long)firstEvent->startEncoderLeft, (long)firstEvent->startEncoderRight,
+           (unsigned long)firstEvent->forwardSourceSerial,
+           (unsigned int)marker.physicalIndex, (unsigned long)marker.epoch,
+           (unsigned int)forwardCount, (long)marker.encoderLeft,
+           (long)marker.encoderRight);
     printf("AUTOFORK event=ARM e1=%u e1_start=%u e1_end=%u current_forward=%u\r\n",
            (unsigned int)g_autoForkReturn.eventId,
            (unsigned int)g_autoForkReturn.forwardStartIndex,
@@ -3201,6 +3278,60 @@ static void BpathControlUpdateIdleRolling(void)
         "ELEVEN_CANDIDATE" : (idle != 0U ? "SEQ11_IDLE" : "SEQ11_CONTEXT");
 
     BPathExternalSetIdleRolling(idle, reason);
+    if (idle != 0U && g_bpathIdleHistoryDegraded == 0U) {
+        g_bpathReturnPathAvailable = 1U;
+    }
+}
+
+/* E1/E2 observation is still forward-only: no reverse has been committed.
+ * Only claim=RETURN and explicit return/recovery phases are BPATH critical. */
+static uint8_t BpathControlTraceIsPreCommit(void)
+{
+    return g_bpathControlState == BPATH_CONTROL_TRACE_RECORD &&
+        g_threeEleven.claim == SEQ11_CLAIM_NONE &&
+        g_threeEleven.paused == 0U ? 1U : 0U;
+}
+
+static const char *BpathControlPreCommitContextName(void)
+{
+    if (g_threeEleven.state == SEQ11_HAVE_FIRST) return "HAVE_FIRST";
+    if (g_threeEleven.state == SEQ11_HAVE_SECOND) return "HAVE_SECOND";
+    if (g_elevenCandidate.active != 0U) return "ELEVEN_CANDIDATE";
+    return "IDLE_TRACE";
+}
+
+static void BpathControlHandlePreCommitEncoderTimeout(void)
+{
+    char text[176];
+
+    BPathExternalInvalidateIdleHistory();
+    g_bpathIdleHistoryDegraded = 1U;
+    g_bpathReturnPathAvailable = 0U;
+    (void)snprintf(text, sizeof(text),
+        "BPATH event=DEGRADED reason=ENCODER_RX_TIMEOUT context=%s e1=%u return_path_valid=0 action=CONTINUE_TRACE",
+        BpathControlPreCommitContextName(), (unsigned int)g_threeEleven.firstEventId);
+    BpathControlPublish(text);
+}
+
+static void BpathControlTryRearmPreCommitHistory(uint32_t now)
+{
+    if (g_bpathIdleHistoryDegraded == 0U || BpathControlTraceIsPreCommit() == 0U ||
+        BPathExternalEncoderFresh(now) == 0) {
+        return;
+    }
+    if (BPathExternalRecordStart(now) == 0) {
+        char text[176];
+        g_bpathIdleHistoryDegraded = 0U;
+        if (g_threeEleven.state == SEQ11_IDLE && g_elevenCandidate.active == 0U) {
+            g_bpathReturnPathAvailable = 1U;
+            BPathExternalSetIdleRolling(1U, "ENCODER_RX_RECOVERED");
+        } else {
+            BPathExternalSetIdleRolling(0U, "PRECOMMIT_HISTORY_UNAVAILABLE");
+        }
+        (void)snprintf(text, sizeof(text), "BPATH event=REARM context=%s return_path_valid=%u",
+            BpathControlPreCommitContextName(), (unsigned int)g_bpathReturnPathAvailable);
+        BpathControlPublish(text);
+    }
 }
 
 /* Test-only first/second raw-11 classifier; it consumes neutral events only. */
@@ -7823,7 +7954,7 @@ static int ReentryRecoveryStart(uint32_t now)
     g_reentryRecoveryPath = (ReentryRecoveryPath){0};
     g_reentryRecoveryPath.recording = 1U;
     /* RecordStart creates the zero source mark.  Do not sample motion until
-     * APPROACH has issued the first forward owner command. */
+     * the first forward reentry owner command has been issued. */
     g_reentryRecoveryPath.recordStartPending = 1U;
     g_reentryRecoveryPath.lastRecordCount = count;
     g_reentryRecoveryPath.anchorLeft = encoder.totalLeft;
@@ -8040,16 +8171,22 @@ static void ReentryTestAutoStart(uint32_t now)
         ReentryTestFail(now, "RECOVERY_RECORD_START_FAILURE");
         return;
     }
-    g_reentryCurveTest.state = REENTRY_TEST_APPROACH;
+    /* The first recovery candidate is deliberately committed LEFT before any
+     * line observation can pull the car back toward the wrong right branch. */
+    g_reentryCurveTest.state = g_reentryCurveTest.attempt == 1U &&
+        g_reentryCurveTest.curve == REENTRY_CURVE_LEFT ?
+        REENTRY_TEST_LEFT_ESTABLISH : REENTRY_TEST_APPROACH;
     g_reentryCurveTest.startTick = now;
     g_reentryCurveTest.captureStableCount = 0U;
     g_reentryCurveTest.post11Active = 0U;
     g_reentryCurveTest.post11Advances = 0U;
     g_reentryCurveTest.departAdvances = 0U;
+    g_reentryCurveTest.leftEstablishmentComplete = 0U;
     /* The preceding reverse owner sent its own command stream; force TRACE to
      * reissue the first forward approach command in this owner loop. */
     g_motorCommandValid = 0U;
-    g_bpathControlState = BPATH_CONTROL_REENTRY_APPROACH;
+    g_bpathControlState = g_reentryCurveTest.state == REENTRY_TEST_LEFT_ESTABLISH ?
+        BPATH_CONTROL_REENTRY_DEPART : BPATH_CONTROL_REENTRY_APPROACH;
     printf("REENTRYATTEMPT event=START history=%s attempt=%u candidate=%s "
            "uses_replay=%u source=%s\r\n",
            ReentryCurveName(g_reentryCurveTest.historyCurve),
@@ -8070,6 +8207,13 @@ static void ReentryTestAutoStart(uint32_t now)
     }
     printf("REENTRYTEST event=AUTO_START curve=%s reason=READY_REENTRY\r\n",
            ReentryCurveName(g_reentryCurveTest.curve));
+    if (g_reentryCurveTest.state == REENTRY_TEST_LEFT_ESTABLISH) {
+        printf("REENTRY event=LEFT_ESTABLISH_START anchor_l=%ld anchor_r=%ld "
+               "target_advances=%u sensor_control=0\r\n",
+               (long)g_reentryRecoveryPath.anchorLeft,
+               (long)g_reentryRecoveryPath.anchorRight,
+               (unsigned int)REENTRY_LEFT_ESTABLISH_ADVANCES);
+    }
 }
 
 static void ReentryReplayApply(ReentryReplayCommand command, int64_t travelLeft,
@@ -8288,6 +8432,60 @@ static void ReentryTestStep(uint32_t now, WifiIotGpioValue rawLeft,
         return;
     }
     elapsedMs = AppTicksToMs(now - g_reentryCurveTest.startTick);
+
+    /* This is intentionally sensor-blind.  The settled recovery anchor is
+     * already BPATH-confirmed; first establish a real leftward departure so
+     * a transient 00/01/11 cannot immediately steer back into the fork. */
+    if (g_reentryCurveTest.state == REENTRY_TEST_LEFT_ESTABLISH) {
+        TraceApplyAction(TRACE_ACTION_LEFT);
+        LineLiveSetControl("REENTRY_LEFT_ESTABLISH", "LEFT_ESTABLISH_LEFT",
+                           TRACE_SLOW_PWM, TRACE_FAST_PWM);
+        if (recordAdvanced != 0U) {
+            g_reentryCurveTest.departAdvances = (uint16_t)
+                (g_reentryCurveTest.departAdvances + recordAdvanced);
+        }
+        if (g_reentryCurveTest.departAdvances < REENTRY_LEFT_ESTABLISH_ADVANCES) {
+            return;
+        }
+        g_reentryCurveTest.leftEstablishmentComplete = 1U;
+        printf("REENTRY event=LEFT_ESTABLISH_DONE advances=%u sensor_control=1\r\n",
+               (unsigned int)g_reentryCurveTest.departAdvances);
+        g_reentryCurveTest.captureStableCount = 0U;
+        g_reentryCurveTest.post11Active = 0U;
+        g_reentryCurveTest.post11Advances = 0U;
+        g_reentryCurveTest.startTick = now;
+        if (g_reentryCurveTest.candidateUsesReplay != 0U) {
+            if (encoder.validCount == 0U) {
+                ReentryTestFail(now, "ENCODER_INVALID");
+                return;
+            }
+            g_reentryCurveTest.replayStartLeftEncoder = encoder.totalLeft;
+            g_reentryCurveTest.replayStartRightEncoder = encoder.totalRight;
+            g_reentryCurveTest.replayEncoderBaselineValid = 1U;
+            g_reentryCurveTest.replayLastCommand = REENTRY_REPLAY_COMMAND_NONE;
+            g_reentryCurveTest.replayEarlySensorLogged = 0U;
+            g_reentryCurveTest.replayMinDwellLogged = 0U;
+            g_reentryCurveTest.replayTrustDeferredLogged = 0U;
+            g_reentryCurveTest.replayTurnCycles = 0U;
+            g_reentryCurveTest.replayFwdCycles = 0U;
+            g_reentryCurveTest.state = REENTRY_TEST_FORCE;
+            g_bpathControlState = BPATH_CONTROL_REENTRY_FORCE;
+            printf("REENTRYREPLAY event=START candidate=LEFT attempt=%u min_ms=%u hard_ms=%u "
+                   "target_left=%llu target_right=%llu target_diff=%lld target_total=%llu target_ratio=%u\r\n",
+                   (unsigned int)g_reentryCurveTest.attempt,
+                   (unsigned int)REENTRY_LEFT_REPLAY_MIN_MS,
+                   (unsigned int)REENTRY_LEFT_REPLAY_HARD_TIMEOUT_MS,
+                   (unsigned long long)g_reentryCurveTest.leftSum,
+                   (unsigned long long)g_reentryCurveTest.rightSum,
+                   (long long)g_reentryCurveTest.diff,
+                   (unsigned long long)(g_reentryCurveTest.leftSum +
+                                        g_reentryCurveTest.rightSum),
+                   (unsigned int)g_reentryCurveTest.ratioPercent);
+        } else {
+            ReentryLineSweepStart(now, "LEFT_ESTABLISH_DONE");
+        }
+        return;
+    }
 
     if (g_reentryCurveTest.state == REENTRY_TEST_APPROACH) {
         if (rawState == 0x03U) {
@@ -8553,7 +8751,10 @@ static void ReentryTestStep(uint32_t now, WifiIotGpioValue rawLeft,
                     return;
                 }
             }
-        } else if (directional != 0U) {
+        } else if (directional != 0U &&
+                   !(g_reentryCurveTest.curve == REENTRY_CURVE_LEFT &&
+                     g_reentryCurveTest.leftEstablishmentComplete != 0U &&
+                     g_stableState == 0x01U)) {
             g_reentryRecoveryPath.directionalStableCount++;
             if (g_reentryRecoveryPath.directionalStableCount >= REENTRY_CAPTURE_STABLE_COUNT) {
                 printf("REENTRYSCAN event=LINE_FOUND attempt=%u candidate=%s sensor=%u lobe=%u recovery_advances=%u\r\n",
@@ -8755,12 +8956,14 @@ static void AutoForkMapFail(const char *reason,
 {
     g_autoForkReturn.state = AUTO_FORK_FAILED;
     g_autoForkReturn.mapFailureReason = reason;
-    printf("AUTOFORKMAP event=FAIL e1_id=%u e1_start_idx=%u forward_points=%u "
+    printf("AUTOFORKMAP event=FAIL e1_id=%u e1_start_idx=%u source_serial=%lu epoch=%lu forward_points=%u "
            "ref_points=%u first_ref_source_idx=%u last_ref_source_idx=%u "
            "nearest_before_source_idx=%u nearest_before_ref_idx=%u "
            "nearest_after_source_idx=%u nearest_after_ref_idx=%u reason=%s\r\n",
            (unsigned int)g_autoForkReturn.eventId,
            (unsigned int)g_autoForkReturn.forwardStartIndex,
+           (unsigned long)g_autoForkReturn.forwardSourceSerial,
+           (unsigned long)g_autoForkReturn.forwardEpoch,
            diagnostics == NULL ? 0U : (unsigned int)diagnostics->forwardPoints,
            diagnostics == NULL ? 0U : (unsigned int)diagnostics->referencePoints,
            diagnostics == NULL ? 0xffffU :
@@ -8782,31 +8985,58 @@ static int AutoForkPrepareReturn(void)
 {
     BPathReferenceMapDiagnostics markDiagnostics;
     BPathReferenceMapDiagnostics originDiagnostics;
+    BPathForwardMarker exactMarker;
+    BPathForwardMarker mappedMarker;
+    BPathForwardMarker baseMarker;
+    BPathForwardMarker backoffMarker;
     uint16_t referenceStartIndex;
+    int32_t mapErrorLeft;
+    int32_t mapErrorRight;
+    uint32_t sourceError;
 
     if (g_autoForkReturn.state != AUTO_FORK_ARMED) {
         AutoForkMapFail("AUTOFORK_STATE_NOT_ARMED", NULL);
         return -1;
     }
-    if (BPathExternalGetReferenceMapDiagnostics(g_autoForkReturn.forwardStartIndex,
+    /* The E1 identity is a monotonic source serial plus recorder epoch.
+     * physicalIndex is re-resolved only for this current buffer instance. */
+    if (g_autoForkReturn.forwardSourceSerial == 0U ||
+        BPathExternalGetForwardMarkerBySerial(g_autoForkReturn.forwardSourceSerial,
+                                              &exactMarker) != 0 ||
+        exactMarker.epoch != g_autoForkReturn.forwardEpoch ||
+        BPathExternalGetReferenceMapDiagnostics(exactMarker.physicalIndex,
                                                 &markDiagnostics) != 0) {
         AutoForkMapFail("E1_MARK_INVALID", &markDiagnostics);
         return -1;
     }
+    g_autoForkReturn.forwardStartIndex = exactMarker.physicalIndex;
     if (markDiagnostics.forwardPoints < g_autoForkReturn.forwardPointCountAtArm) {
         AutoForkMapFail("BPATH_EPOCH_MISMATCH", &markDiagnostics);
         return -1;
     }
-    if (BPathExternalMapForwardIndexToReference(g_autoForkReturn.forwardStartIndex,
-                                                &g_autoForkReturn.markReferenceIndex) != 0) {
-        /* This is not an exact-match test: the mapper accepts the first
-         * reverse source at or before E1.  Reaching here means no safe lower
-         * reference exists at all. */
+    if (BPathExternalMapForwardSourceSerialToReference(
+            g_autoForkReturn.forwardSourceSerial,
+            &g_autoForkReturn.markReferenceIndex, &mappedMarker) != 0 ||
+        mappedMarker.epoch != g_autoForkReturn.forwardEpoch) {
         AutoForkMapFail("E1_SAFE_REFERENCE_MISS", &markDiagnostics);
         return -1;
     }
+    sourceError = g_autoForkReturn.forwardSourceSerial >= mappedMarker.sourceSerial ?
+        g_autoForkReturn.forwardSourceSerial - mappedMarker.sourceSerial :
+        mappedMarker.sourceSerial - g_autoForkReturn.forwardSourceSerial;
+    mapErrorLeft = mappedMarker.encoderLeft - exactMarker.encoderLeft;
+    mapErrorRight = mappedMarker.encoderRight - exactMarker.encoderRight;
+    if (mapErrorLeft > AUTOFORK_REFERENCE_MAP_MAX_ENCODER_ERROR ||
+        mapErrorLeft < -AUTOFORK_REFERENCE_MAP_MAX_ENCODER_ERROR ||
+        mapErrorRight > AUTOFORK_REFERENCE_MAP_MAX_ENCODER_ERROR ||
+        mapErrorRight < -AUTOFORK_REFERENCE_MAP_MAX_ENCODER_ERROR) {
+        AutoForkMapFail("E1_REFERENCE_MAP_ERROR_TOO_LARGE", &markDiagnostics);
+        return -1;
+    }
     if (BPathExternalGetReferenceMapDiagnostics(0U, &originDiagnostics) != 0 ||
-        BPathExternalMapForwardIndexToReference(0U, &referenceStartIndex) != 0) {
+        BPathExternalMapForwardIndexToReference(0U, &referenceStartIndex) != 0 ||
+        BPathExternalGetForwardBaseMarker(&baseMarker) != 0 ||
+        baseMarker.epoch != g_autoForkReturn.forwardEpoch) {
         AutoForkMapFail("BPATH_ORIGIN_REFERENCE_MISS", &markDiagnostics);
         return -1;
     }
@@ -8824,7 +9054,46 @@ static int AutoForkPrepareReturn(void)
     g_autoForkReturn.returnCursor = 0U;
     g_autoForkReturn.backoffProgress = 0U;
     g_autoForkReturn.markReached = 0U;
+    if (BPathExternalGetReferenceMarker(g_autoForkReturn.backoffStopReferenceIndex,
+                                        &backoffMarker) != 0 ||
+        backoffMarker.epoch != g_autoForkReturn.forwardEpoch) {
+        AutoForkMapFail("BPATH_BACKOFF_TARGET_INVALID", &markDiagnostics);
+        return -1;
+    }
     g_autoForkReturn.state = AUTO_FORK_RETURNING_TO_MARK;
+    printf("AUTOFORKMARK event=TARGET_MAP id=%u saved_logical_source=%lu "
+           "saved_physical_index=%u current_base_source=%lu mapped_index=%u "
+           "reverse_ref=%u mapped_source_serial=%lu mapped_enc_l=%ld mapped_enc_r=%ld "
+           "capture_enc_l=%ld capture_enc_r=%ld capture_delta_l=%ld capture_delta_r=%ld "
+           "source_error=%lu backoff=%u backoff_direction=OLDER final_ref=%u "
+           "target_l=%ld target_r=%ld\r\n",
+           (unsigned int)g_autoForkReturn.eventId,
+           (unsigned long)g_autoForkReturn.forwardSourceSerial,
+           (unsigned int)g_autoForkReturn.forwardStartIndex,
+           (unsigned long)baseMarker.sourceSerial,
+           (unsigned int)mappedMarker.physicalIndex,
+           (unsigned int)g_autoForkReturn.markReferenceIndex,
+           (unsigned long)mappedMarker.sourceSerial,
+           (long)mappedMarker.encoderLeft, (long)mappedMarker.encoderRight,
+           (long)g_autoForkReturn.captureEncoderLeft,
+           (long)g_autoForkReturn.captureEncoderRight,
+           (long)(mappedMarker.encoderLeft - g_autoForkReturn.captureEncoderLeft),
+           (long)(mappedMarker.encoderRight - g_autoForkReturn.captureEncoderRight),
+           (unsigned long)sourceError,
+           (unsigned int)FORK_BACKOFF_SAMPLES,
+           (unsigned int)g_autoForkReturn.backoffStopReferenceIndex,
+           (long)backoffMarker.encoderLeft, (long)backoffMarker.encoderRight);
+    printf("AUTOFORKMAP event=TARGET e1_id=%u e1_start_idx=%u forward_points=%u "
+           "ref_points=%u mapped_reverse_ref=%u mapped_source_idx=%u "
+           "reference_origin=%u mapped_backoff_ref=%u\r\n",
+           (unsigned int)g_autoForkReturn.eventId,
+           (unsigned int)g_autoForkReturn.forwardStartIndex,
+           (unsigned int)markDiagnostics.forwardPoints,
+           (unsigned int)markDiagnostics.referencePoints,
+           (unsigned int)g_autoForkReturn.markReferenceIndex,
+           (unsigned int)mappedMarker.physicalIndex,
+           (unsigned int)referenceStartIndex,
+           (unsigned int)g_autoForkReturn.backoffStopReferenceIndex);
     printf("AUTOFORK event=RETURN_BEGIN mark_forward=%u mark_reverse=%u\r\n",
            (unsigned int)g_autoForkReturn.forwardStartIndex,
            (unsigned int)g_autoForkReturn.markReferenceIndex);
@@ -9460,6 +9729,9 @@ static void CarControlTask(void *argument)
                 returnRight = 0;
                 g_manualReturnPipelineActive = 0U;
                 g_autoForkReturn.state = AUTO_FORK_READY_REENTRY;
+                printf("REENTRY event=RETURN_COMPLETE source=BPATH e1=%u backoff=%u\r\n",
+                       (unsigned int)g_autoForkReturn.eventId,
+                       (unsigned int)g_autoForkReturn.backoffProgress);
                 ReentryAnchorSettleBegin(now, 0U);
                 printf("AUTOFORK event=READY_REENTRY e1=%u backoff=%u\r\n",
                        (unsigned int)g_autoForkReturn.eventId,
@@ -9983,6 +10255,7 @@ static void CarControlTask(void *argument)
                         EncoderExperimentSendMotorCommand(0, 0, now);
                     }
                     if (g_bpathControlState == BPATH_CONTROL_TRACE_RECORD) {
+                        g_bpathRecordWasPreCommit = BpathControlTraceIsPreCommit();
 #if (AUTO_RETURN_ON_11_TEST_MODE == 1)
                         if (g_bpathAutoBootRun != 0U && g_stableState == 0x03U) {
                             if (g_autoReturn11Active == 0U) {
@@ -10097,7 +10370,8 @@ static void CarControlTask(void *argument)
                                 /* A malformed E1 path mark must not be mapped to an
                                  * arbitrary reverse target.  Stop via the existing
                                  * safe BPATH abort path instead. */
-                                BpathControlAbort("AUTOFORK_INVALID_E1_MARK");
+                                BpathControlAbort(g_bpathReturnPathAvailable == 0U ?
+                                    "RETURN_PATH_UNAVAILABLE" : "AUTOFORK_INVALID_E1_MARK");
                             } else {
                                 g_doubleStopReturnAuthorized = 1U;
                                 g_doubleStopTestReturnActive = 1U;
@@ -10153,10 +10427,22 @@ static void CarControlTask(void *argument)
 #if (ENCODER_BPATH_FOLLOW_V1_TEST_MODE == 1)
             if (g_bpathControlState == BPATH_CONTROL_TRACE_RECORD) {
                 TraceRecordDiagPublish(traceDiagRawLeft, traceDiagRawRight, now);
-                BpathControlUpdateIdleRolling();
-                if (BPathExternalRecordStep(now) != 0) {
-                    EncoderExperimentSendMotorCommand(0, 0, now);
-                    BpathControlAbort("FORWARD_RECORD_FAILURE");
+                if (g_bpathIdleHistoryDegraded != 0U) {
+                    /* The sensor resolver remains the TRACE motor owner while
+                     * pre-commit history awaits a fresh encoder frame. */
+                    BpathControlTryRearmPreCommitHistory(now);
+                } else {
+                    BpathControlUpdateIdleRolling();
+                    if (BPathExternalRecordStep(now) != 0) {
+                        if ((BpathControlTraceIsPreCommit() != 0U ||
+                             g_bpathRecordWasPreCommit != 0U) &&
+                            BPathExternalLastAbortWasEncoderRxTimeout() != 0) {
+                            BpathControlHandlePreCommitEncoderTimeout();
+                        } else {
+                            EncoderExperimentSendMotorCommand(0, 0, now);
+                            BpathControlAbort("FORWARD_RECORD_FAILURE");
+                        }
+                    }
                 }
             }
 #endif
