@@ -26,7 +26,6 @@
 
 /* Attended proof only: an operator supplies the first taken branch. */
 #define FORK_BACKTRACK_PROOF_TEST_MODE 1
-
 /* Narrow attended experiment: replay the pre-E1 curve once after TWO_LONG. */
 #define PRE_E1_CURVE_GUIDED_REENTRY_TEST_MODE 1
 

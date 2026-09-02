@@ -1,6 +1,5 @@
 #include <stdint.h>
 #include <stdio.h>
-#include <string.h>
 
 #include "app_time.h"
 #include "task_encoder_bpath_follow.h"
@@ -133,13 +132,6 @@ static BpfReferencePoint g_reference[BPF_MAX_POINTS];
 /* Source forward index for each reverse-reference point, descending by design. */
 static uint16_t g_referenceForwardIndex[BPF_MAX_POINTS];
 static uint16_t g_forwardCount, g_followCount, g_referenceCount;
-/* Serial identity is derived, never duplicated in every point.  The forward
- * buffer stays serial-contiguous; idle compaction advances its base. */
-static uint32_t g_forwardSourceSerialNext;
-static uint32_t g_forwardBaseSourceSerial;
-static uint16_t g_forwardSerialAssignedCount;
-/* Epoch changes only when a wholly new external recorder is started. */
-static uint32_t g_forwardEpoch;
 static uint16_t g_forwardDumpIndex, g_followDumpIndex, g_referenceIndex;
 static uint32_t g_stateMs, g_followStartMs, g_readyBase, g_lastArm, g_lastSummary;
 static uint32_t g_forwardPathStartMs, g_reversePathStartMs;
@@ -368,19 +360,6 @@ static void BpfPathAdd(BpfPathPoint *path, uint16_t *count, uint8_t *overflow,
     (*count)++;
 }
 
-static void BpfAssignForwardSourceSerial(void)
-{
-    if (g_forwardCount > g_forwardSerialAssignedCount) {
-        if (g_forwardSerialAssignedCount == 0U) {
-            g_forwardBaseSourceSerial = ++g_forwardSourceSerialNext;
-        } else {
-            g_forwardSourceSerialNext +=
-                (uint32_t)(g_forwardCount - g_forwardSerialAssignedCount);
-        }
-        g_forwardSerialAssignedCount = g_forwardCount;
-    }
-}
-
 /* Rebase the existing single forward array around its newest retained tail.
  * The stored travel remains real encoder-relative travel, but its new zero is
  * the first retained source point so later appends and BPATH reference build
@@ -414,8 +393,6 @@ static void BpfCompactIdleForwardTail(void)
         g_forwardPath[index].right -= baseRight;
     }
     g_forwardCount = keep;
-    g_forwardBaseSourceSerial += start;
-    g_forwardSerialAssignedCount = keep;
     g_result.fStartL += baseLeft;
     g_result.fStartR += baseRight;
     g_result.boundaryL = g_result.fStartL;
@@ -431,11 +408,9 @@ static void BpfCompactIdleForwardTail(void)
 static void BpfStartForwardPath(const UdpEncoderTelemetryState *encoder, uint32_t ms)
 {
     g_forwardCount = 0U; g_forwardOverflow = 0U; g_forwardLastValid = encoder->validCount;
-    g_forwardSerialAssignedCount = 0U;
     g_forwardPathStartMs = ms;
     BpfPathAdd(g_forwardPath, &g_forwardCount, &g_forwardOverflow, BPF_FWD_ACTIVE,
                encoder->sequence, 0U, 0, 0, 0, 0, 0, 0U, BPF_B_LEFT, BPF_B_RIGHT);
-    BpfAssignForwardSourceSerial();
 }
 
 static void BpfRecordForward(const UdpEncoderTelemetryState *encoder, uint32_t ms,
@@ -446,7 +421,6 @@ static void BpfRecordForward(const UdpEncoderTelemetryState *encoder, uint32_t m
     BpfPathAdd(g_forwardPath, &g_forwardCount, &g_forwardOverflow, phase, encoder->sequence,
                ms - g_forwardPathStartMs, encoder->totalLeft - g_result.boundaryL,
                encoder->totalRight - g_result.boundaryR, 0, 0, 0, 0U, leftCmd, rightCmd);
-    BpfAssignForwardSourceSerial();
 }
 
 static void BpfFinalForward(uint32_t ms)
@@ -454,7 +428,6 @@ static void BpfFinalForward(uint32_t ms)
     BpfPathAdd(g_forwardPath, &g_forwardCount, &g_forwardOverflow, BPF_FWD_FINAL,
                g_result.fEndSeq, ms - g_forwardPathStartMs, g_result.bLeft,
                g_result.bRight, 0, 0, 0, 0U, 0, 0);
-    BpfAssignForwardSourceSerial();
 }
 
 static int BpfBuildReference(void)
@@ -691,7 +664,6 @@ void BPathFollowInit(void)
 {
     g_state = BPF_WAIT; g_sync = BPF_SYNC; g_dumpState = BPF_DUMP_IDLE;
     g_result = (BpfResult){0}; g_forwardCount = g_followCount = g_referenceCount = 0U;
-    g_forwardSerialAssignedCount = 0U;
     g_forwardDumpIndex = g_followDumpIndex = g_referenceIndex = 0U;
     g_forwardOverflow = g_followOverflow = 0U;
     g_stateMs = g_followStartMs = g_readyBase = g_lastArm = g_lastSummary = 0U;
@@ -753,18 +725,11 @@ int BPathExternalRecordStart(uint32_t now)
     uint32_t ms = AppTicksToMs(now);
 
     UdpTelemetryReadEncoder(&encoder);
-    if (!BpfFresh(&encoder, ms, BPF_RX_TIMEOUT_MS)) {
-        BpfAbort("ENCODER_RX_TIMEOUT");
-        return -1;
-    }
     g_result.fStartL = g_result.boundaryL = encoder.totalLeft;
     g_result.fStartR = g_result.boundaryR = encoder.totalRight;
     g_result.fStartSeq = g_result.boundarySeq = encoder.sequence;
     g_result.fStartFrames = encoder.validCount;
     g_forwardCount = 0U;
-    g_forwardSerialAssignedCount = 0U;
-    g_forwardEpoch++;
-    if (g_forwardEpoch == 0U) g_forwardEpoch = 1U;
     g_forwardOverflow = 0U;
     g_externalIdleRolling = 0U;
     g_externalIdleRollingEver = 0U;
@@ -772,31 +737,8 @@ int BPathExternalRecordStart(uint32_t now)
     g_forwardPathStartMs = ms;
     BpfPathAdd(g_forwardPath, &g_forwardCount, &g_forwardOverflow, BPF_FWD_ACTIVE,
                encoder.sequence, 0U, 0, 0, 0, 0, 0, 0U, 0, 0);
-    BpfAssignForwardSourceSerial();
     BpfPublish("TRACE_RECORD_START");
     return 0;
-}
-
-int BPathExternalEncoderFresh(uint32_t now)
-{
-    UdpEncoderTelemetryState encoder;
-
-    UdpTelemetryReadEncoder(&encoder);
-    return BpfFresh(&encoder, AppTicksToMs(now), BPF_RX_TIMEOUT_MS);
-}
-
-int BPathExternalLastAbortWasEncoderRxTimeout(void)
-{
-    return g_state == BPF_ABORT && g_result.abortReason != NULL &&
-        strcmp(g_result.abortReason, "ENCODER_RX_TIMEOUT") == 0;
-}
-
-void BPathExternalInvalidateIdleHistory(void)
-{
-    /* The rolling tail is optional until an Eleven candidate freezes it.
-     * Discard invalid source indices rather than allowing a later fork return
-     * to consume encoder data across a receive gap. */
-    BPathFollowInit();
 }
 
 void BPathExternalSetIdleRolling(uint8_t enabled, const char *reason)
@@ -829,11 +771,8 @@ int BPathExternalRecordStep(uint32_t now)
     uint32_t ms = AppTicksToMs(now);
 
     UdpTelemetryReadEncoder(&encoder);
-    if (!BpfFresh(&encoder, ms, BPF_RX_TIMEOUT_MS)) {
-        BpfAbort("ENCODER_RX_TIMEOUT");
-        return -1;
-    }
     if (encoder.validCount == g_forwardLastValid) {
+        BpfPublish("BPATH event=WAIT_ENCODER_SKIP");
         return 0;
     }
     if (g_externalIdleRolling != 0U) {
@@ -845,7 +784,6 @@ int BPathExternalRecordStep(uint32_t now)
                encoder.sequence, ms - g_forwardPathStartMs,
                encoder.totalLeft - g_result.fStartL,
                encoder.totalRight - g_result.fStartR, 0, 0, 0, 0U, 0, 0);
-    BpfAssignForwardSourceSerial();
     if (g_forwardOverflow != 0U) {
         BpfAbort("FORWARD_OVERFLOW");
         return -1;
@@ -880,42 +818,6 @@ void BPathExternalGetForwardRecordProgress(uint16_t *count, uint16_t *capacity)
     if (capacity != NULL) {
         *capacity = BPF_MAX_POINTS;
     }
-}
-
-static void BpfForwardMarkerAt(uint16_t index, BPathForwardMarker *marker)
-{
-    marker->physicalIndex = index;
-    marker->sourceSerial = g_forwardBaseSourceSerial + index;
-    marker->epoch = g_forwardEpoch;
-    marker->encoderLeft = g_result.fStartL + g_forwardPath[index].left;
-    marker->encoderRight = g_result.fStartR + g_forwardPath[index].right;
-}
-
-int BPathExternalGetForwardRecordMarker(BPathForwardMarker *marker)
-{
-    if (marker == NULL || g_forwardCount == 0U) return -1;
-    BpfForwardMarkerAt((uint16_t)(g_forwardCount - 1U), marker);
-    return 0;
-}
-
-int BPathExternalGetForwardBaseMarker(BPathForwardMarker *marker)
-{
-    if (marker == NULL || g_forwardCount == 0U) return -1;
-    BpfForwardMarkerAt(0U, marker);
-    return 0;
-}
-
-int BPathExternalGetForwardMarkerBySerial(uint32_t sourceSerial,
-                                          BPathForwardMarker *marker)
-{
-    uint16_t index;
-
-    if (marker == NULL || sourceSerial < g_forwardBaseSourceSerial) return -1;
-    index = (uint16_t)(sourceSerial - g_forwardBaseSourceSerial);
-    if ((uint32_t)index != sourceSerial - g_forwardBaseSourceSerial ||
-        index >= g_forwardCount) return -1;
-    BpfForwardMarkerAt(index, marker);
-    return 0;
 }
 
 int BPathExternalGetForwardRecordIndex(uint16_t *index)
@@ -1000,39 +902,6 @@ int BPathExternalMapForwardIndexToReference(uint16_t forwardIndex, uint16_t *ref
         return 0;
     }
     return -1;
-}
-
-int BPathExternalMapForwardSourceSerialToReference(uint32_t sourceSerial,
-                                                    uint16_t *referenceIndex,
-                                                    BPathForwardMarker *mappedMarker)
-{
-    BPathForwardMarker exactMarker;
-    uint16_t reference;
-    uint16_t mappedSource;
-
-    if (referenceIndex == NULL || mappedMarker == NULL ||
-        BPathExternalGetForwardMarkerBySerial(sourceSerial, &exactMarker) != 0 ||
-        BPathExternalMapForwardIndexToReference(exactMarker.physicalIndex, &reference) != 0 ||
-        reference >= g_referenceCount) {
-        return -1;
-    }
-    mappedSource = g_referenceForwardIndex[reference];
-    if (mappedSource >= g_forwardCount) return -1;
-    BpfForwardMarkerAt(mappedSource, mappedMarker);
-    *referenceIndex = reference;
-    return 0;
-}
-
-int BPathExternalGetReferenceMarker(uint16_t referenceIndex,
-                                    BPathForwardMarker *marker)
-{
-    uint16_t sourceIndex;
-
-    if (marker == NULL || referenceIndex >= g_referenceCount) return -1;
-    sourceIndex = g_referenceForwardIndex[referenceIndex];
-    if (sourceIndex >= g_forwardCount) return -1;
-    BpfForwardMarkerAt(sourceIndex, marker);
-    return 0;
 }
 
 int BPathExternalGetReturnReferenceCursor(uint16_t *referenceIndex)
