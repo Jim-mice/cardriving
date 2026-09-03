@@ -2418,11 +2418,10 @@ static ElevenEventSignal ElevenEventObserve(uint32_t now, WifiIotGpioValue rawLe
         }
         g_elevenCandidate.active = 1U;
         g_elevenCandidate.qualified = 0U;
-        g_elevenCandidate.stable11Samples = 1U;
+        /* Experiment: a single valid stable-11 sample qualifies immediately. */
+        g_elevenCandidate.stable11Samples = 2U;
         g_elevenEventPreviousStable = stableState;
         printf("SEQ11EVT event=CAND start=%u\r\n", (unsigned int)g_elevenCandidate.startMs);
-        ElevenEventSyncLineLive();
-        return ELEVEN_EVENT_SIGNAL_NONE;
     }
     if (g_elevenCandidate.active != 0U && stableState == 0x03U &&
         g_elevenCandidate.qualified == 0U) {
@@ -2464,6 +2463,12 @@ static ElevenEventSignal ElevenEventObserve(uint32_t now, WifiIotGpioValue rawLe
                    (unsigned int)event->id, (unsigned int)event->enterMs,
                    (unsigned int)nowMs, (unsigned int)dwellMs,
                    (unsigned int)event->forwardPathStartIndex);
+            printf("EVENT | ELEVEN_QUALIFIED_TEST sample_time=%u raw_sensor=%02x event_id=%u current_phase=%s current_state=%s E1=%u E2=%u E3=%u single_sample=yes\r\n",
+                   (unsigned int)nowMs, (unsigned int)rawState,
+                   (unsigned int)event->id, g_lineLivePhase, g_lineLiveSeq11State,
+                   (unsigned int)g_lineLiveSeq11E1,
+                   (unsigned int)g_lineLiveSeq11E2,
+                   (unsigned int)g_lineLiveSeq11E3);
             g_elevenEventPreviousStable = stableState;
             ElevenEventSyncLineLive();
             return ELEVEN_EVENT_SIGNAL_ENTER;
