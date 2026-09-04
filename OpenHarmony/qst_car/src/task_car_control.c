@@ -176,8 +176,8 @@
 #define REENTRY_REEXIT_MAX_ADVANCES REENTRY_NO_HISTORY_DEPART_ADVANCES
 
 #define TRACE_FORWARD_SPEED    100
-#define TRACE_SLOW_PWM         90
-#define TRACE_FAST_PWM         110
+#define TRACE_SLOW_PWM         75
+#define TRACE_FAST_PWM         125
 #define TRACE_OUTER_SPEED      TRACE_FAST_PWM
 #define TRACE_INNER_SPEED      TRACE_SLOW_PWM
 #define TRACE_RECOVER_SPEED    120
@@ -249,7 +249,7 @@
 #define REENTRY_BIAS_MS               1200U
 #define REENTRY_MICRO_STRAIGHT_MS     300U
 #define REENTRY_SENSOR_ACQUIRE_MS     2000U
-static const uint8_t g_reentryWheelPairs[11][2] = {
+static const uint8_t g_reentryWheelPairs[11][2] __attribute__((unused)) = {
     {90U,110U},{92U,108U},{94U,106U},{96U,104U},{98U,102U},{100U,100U},
     {102U,98U},{104U,96U},{106U,94U},{108U,92U},{110U,90U}
 };
@@ -884,6 +884,37 @@ static void BpathControlAbort(const char *reason)
     (void)snprintf(text, sizeof(text), "BPATHCTL event=ABORT reason=%s", reason);
     BpathControlPublish(text);
     BpathControlFinish();
+}
+
+static void BpathControlRecoverFromForwardOverflow(uint32_t now)
+{
+    BPathFollowInit();
+    g_bpathAbortStop = 0U;
+    g_manualReturnAuthorized = 0U;
+    g_doubleStopReturnAuthorized = 0U;
+    g_manualReturnPipelineActive = 0U;
+    g_returnTrigger = "NONE";
+    g_startLineConsumed = 0U;
+    g_startLineEventId = 0U;
+    TraceCurveReset();
+    CrossbarObserverStop(now, "FORWARD_OVERFLOW_RECOVER");
+    CrossbarRawForensicsReset();
+    Long11ObserverReset();
+    RightStoplineCandidateObserverReset();
+    DoubleStopAutoReturnObserverReset();
+    ElevenEventReset();
+    ThreeElevenResetForTrace();
+    AutoForkReturnReset();
+    ForkTestReset();
+    ReentryCurveTestReset();
+    TraceResetState11Counter();
+    TraceClearActiveCorrection();
+    TraceBiasReset(now);
+    g_bpathControlState = BPATH_CONTROL_TRACE_RECORD;
+    g_sensorSemanticValid = 1U;
+    (void)BPathExternalRecordStart(now);
+    LineLiveSetControl("TRACE", "TRACE_RECOVER", 0, 0);
+    BpathControlPublish("BPATHCTL event=TRACE_RECOVER reason=FORWARD_OVERFLOW");
 }
 
 static void BpathControlReturnGuardBlock(const char *fromState,
@@ -2958,9 +2989,6 @@ static void ClosePairTerminalObserve(uint32_t now, uint8_t stableState)
                            (unsigned int)g_sensorSemanticEpoch,
                            (unsigned int)gapMs,
                            (unsigned long long)averageTravel);
-                    g_threeEleven.claim = SEQ11_CLAIM_STOP;
-                    g_threeEleven.paused = 1U;
-                    g_lineLiveSeq11Decision = "CLOSE_PAIR_STOP";
                     ThreeElevenSyncLineLive();
                 } else if (g_closePairTerminal.pulseOneExitEncoderValid != 0U &&
                            encoder.validCount != 0U && deltaLeft >= 0 && deltaRight >= 0) {
@@ -7872,7 +7900,7 @@ static void ReentryAnchorSettleStep(uint32_t now)
     g_bpathControlState = BPATH_CONTROL_FORK_READY;
 }
 
-static int ReentryRecoveryStart(uint32_t now)
+__attribute__((unused)) static int ReentryRecoveryStart(uint32_t now)
 {
     uint16_t count = 0U;
     UdpEncoderTelemetryState encoder;
@@ -8041,56 +8069,18 @@ static void ReentryStraightTraceHandoff(uint32_t now)
  * explicit 0/0 cycle.  It does not write motors itself. */
 static void ReentryTestAutoStart(uint32_t now)
 {
-    const char *source = "UNKNOWN";
-
     if ((g_reentryCurveTest.state != REENTRY_TEST_READY &&
          g_reentryCurveTest.state != REENTRY_TEST_RETRY_READY) ||
         g_bpathControlState != BPATH_CONTROL_FORK_READY ||
         g_autoForkReturn.state != AUTO_FORK_READY_REENTRY) {
         return;
     }
-    if (g_reentryCurveTest.candidateIndex >= 11U) {
-        g_reentryCurveTest.candidateIndex = 0U;
-    }
-    g_reentryCurveTest.attempt = (uint8_t)(g_reentryCurveTest.candidateIndex + 1U);
-    g_reentryCurveTest.leftExploreStarted = 0U;
-    source = "WHEEL_PAIR";
-    if (ReentryRecoveryStart(now) != 0) {
-        ReentryTestFail(now, "RECOVERY_RECORD_START_FAILURE");
-        return;
-    }
-    g_reentryCurveTest.startTick = now;
-    g_reentryCurveTest.captureStableCount = 0U;
-    g_reentryCurveTest.post11Active = 0U;
-    g_reentryCurveTest.post11Advances = 0U;
-    g_reentryCurveTest.departAdvances = 0U;
-    printf("REENTRYATTEMPT event=START history=%s attempt=%u candidate=%s "
-           "uses_replay=%u source=%s\r\n",
-           ReentryCurveName(g_reentryCurveTest.historyCurve),
-           (unsigned int)g_reentryCurveTest.attempt,
-           ReentryCurveName(g_reentryCurveTest.curve),
-           (unsigned int)g_reentryCurveTest.candidateUsesReplay, source);
     g_reentryCurveTest.state = REENTRY_TEST_LEFT_ESTABLISH;
+    g_reentryCurveTest.leftExploreStartTick = now;
     g_bpathControlState = BPATH_CONTROL_REENTRY_LEFT_ESTABLISH;
-    printf("REENTRY event=CANDIDATE_START index=%u pwm_l=%u pwm_r=%u\r\n",
-           (unsigned int)g_reentryCurveTest.candidateIndex,
-           (unsigned int)g_reentryWheelPairs[g_reentryCurveTest.candidateIndex][0],
-           (unsigned int)g_reentryWheelPairs[g_reentryCurveTest.candidateIndex][1]);
-    return;
-    if (g_reentryCurveTest.candidateUsesReplay == 0U &&
-        (g_reentryCurveTest.curve == REENTRY_CURVE_LEFT ||
-         g_reentryCurveTest.curve == REENTRY_CURVE_RIGHT)) {
-        printf("REENTRYSEARCH event=START attempt=%u candidate=%s depart_advances=%u "
-               "sweep_scale=%u lobe_advances=%u max_lobes=%u\r\n",
-               (unsigned int)g_reentryCurveTest.attempt,
-               ReentryCurveName(g_reentryCurveTest.curve),
-               (unsigned int)REENTRY_NO_HISTORY_DEPART_ADVANCES,
-               (unsigned int)REENTRY_SWEEP_SCALE_PERCENT,
-               (unsigned int)REENTRY_SWEEP_LOBE_ADVANCES,
-               (unsigned int)REENTRY_SWEEP_MAX_LOBES);
-    }
-    printf("REENTRYTEST event=AUTO_START curve=%s reason=READY_REENTRY\r\n",
-           ReentryCurveName(g_reentryCurveTest.curve));
+    printf("REENTRY event=LEFT_TURN_START pwm_l=%d pwm_r=%d duration_ms=%u\r\n",
+           TRACE_SLOW_PWM, TRACE_FAST_PWM,
+           (unsigned int)REENTRY_MICRO_STRAIGHT_MS);
 }
 
 static void ReentryReplayApply(ReentryReplayCommand command, int64_t travelLeft,
@@ -8297,41 +8287,19 @@ static void ReentryTestStep(uint32_t now, WifiIotGpioValue rawLeft,
     rawState = (uint8_t)((rawLeft == WIFI_IOT_GPIO_VALUE1 ? 2U : 0U) |
                          (rawRight == WIFI_IOT_GPIO_VALUE1 ? 1U : 0U));
     if (g_reentryCurveTest.state == REENTRY_TEST_LEFT_ESTABLISH) {
-        UdpTelemetryReadEncoder(&encoder);
-        if (rawState == 0x03U) {
-            printf("ADMIN event=IGNORED_11 sensor_valid=0 phase=LEFT_ESTABLISH\r\n");
-        }
-        if (ReentryRecoveryRecordStep(now, &recordAdvanced) != 0) {
-            ReentryTestFail(now, g_reentryRecoveryPath.failureReason);
-            return;
-        }
-        if (recordAdvanced != 0U) {
-            g_reentryCurveTest.departAdvances = (uint16_t)
-                (g_reentryCurveTest.departAdvances + recordAdvanced);
-        }
-        if (g_reentryCurveTest.leftExploreStarted == 0U) {
-            g_reentryCurveTest.leftExploreStarted = 1U;
-            g_reentryCurveTest.leftExploreStartTick = now;
-            g_reentryCurveTest.leftExploreStartEncoder = encoder.totalLeft;
-            g_reentryCurveTest.rightExploreStartEncoder = encoder.totalRight;
-            printf("REENTRY event=LEFT_EXPLORE_START pwm_l=%d pwm_r=%d min_ms=%u\r\n",
-                   REENTRY_LEFT_EXPLORE_PWM_L, REENTRY_LEFT_EXPLORE_PWM_R,
-                   (unsigned int)REENTRY_LEFT_EXPLORE_MIN_MS);
-        }
-        TraceSendMotorCommand(g_reentryWheelPairs[g_reentryCurveTest.candidateIndex][0],
-                              g_reentryWheelPairs[g_reentryCurveTest.candidateIndex][1], 0);
+        TraceSendMotorCommand(TRACE_SLOW_PWM, TRACE_FAST_PWM, 0);
         g_lastAction = TRACE_ACTION_LEFT;
-        LineLiveSetControl("REENTRY_LEFT_EXPLORE", "LEFT",
-                           g_reentryWheelPairs[g_reentryCurveTest.candidateIndex][0],
-                           g_reentryWheelPairs[g_reentryCurveTest.candidateIndex][1]);
+        LineLiveSetControl("REENTRY_LEFT_TURN", "LEFT",
+                           TRACE_SLOW_PWM, TRACE_FAST_PWM);
         elapsedMs = AppTicksToMs(now - g_reentryCurveTest.leftExploreStartTick);
-        if (elapsedMs >= REENTRY_BIAS_MS) {
-            g_reentryCurveTest.phaseStartTick = now;
-            g_reentryCurveTest.state = REENTRY_TEST_DEPART;
-            g_bpathControlState = BPATH_CONTROL_REENTRY_DEPART;
-            printf("REENTRY event=MICRO_STRAIGHT index=%u elapsed_ms=%u\r\n",
-                   (unsigned int)g_reentryCurveTest.candidateIndex,
-                   (unsigned int)elapsedMs);
+        if (elapsedMs >= REENTRY_MICRO_STRAIGHT_MS) {
+            if (ReentryTestStartNewTraceEpoch(now) != 0) {
+                TraceApplyAction(TRACE_ACTION_STOP);
+                LineLiveSetControl("REENTRY_FAIL", "STOP", 0, 0);
+            } else {
+                printf("REENTRY event=TRACE_HANDOFF elapsed_ms=%u\r\n",
+                       (unsigned int)elapsedMs);
+            }
         }
         return;
     }
@@ -10188,8 +10156,7 @@ static void CarControlTask(void *argument)
                 TraceRecordDiagPublish(traceDiagRawLeft, traceDiagRawRight, now);
                 BpathControlUpdateIdleRolling();
                 if (BPathExternalRecordStep(now) != 0) {
-                    EncoderExperimentSendMotorCommand(0, 0, now);
-                    BpathControlAbort("FORWARD_RECORD_FAILURE");
+                    BpathControlRecoverFromForwardOverflow(now);
                 }
             }
 #endif
