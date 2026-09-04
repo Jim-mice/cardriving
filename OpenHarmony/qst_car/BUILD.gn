@@ -1,8 +1,18 @@
 static_library("qst_car") {
+    motion_replay_only = true
 
+    if (motion_replay_only) {
+        sources = [
+            "qst_car_main.c",
+            "src/motion_replay.c",
+            "src/Peripheral.c",
+            "src/robot_l9110s.c",
+        ]
+    } else {
     sources = [
         "qst_car_main.c",
         "src/task_hello.c",
+        "src/motion_replay.c",
         "src/task_wifi.c",
         "src/wifi_connect.c",
 
@@ -38,6 +48,7 @@ static_library("qst_car") {
         "src/task_encoder_bpath_follow.c",
         "src/task_motor_response.c",
     ]
+    }
 
     include_dirs = [
         "include",

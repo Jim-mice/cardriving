@@ -17,10 +17,12 @@
 #include "task_car_control.h"
 #include "udp_telemetry.h"
 #include "task_encoder_cal.h"
+#include "motion_replay.h"
 
 #define WIFI_STA_START_WAIT_MS 6000
 #define CLOUD_VALIDATION_MODE 1
 #define CLOUD_LAUNCH_RETRY_MS 2000U
+#define MOTION_REPLAY_BOOT_MODE 1
 
 /* Low-frequency boot-only allocator diagnostics. LOS_MEM_STATUS.totalSize is
  * the largest contiguous free block in this Hi3861 LiteOS implementation. */
@@ -40,6 +42,19 @@ static void MemBootPublish(const char *stage)
 
 static void QstCarTask(void)
 {
+#if (MOTION_REPLAY_BOOT_MODE == 1)
+    printf("QST motion replay start\r\n");
+    Peripheral_Init();
+    MemBootPublish("MOTION_REPLAY_BOOT");
+
+    if (MotionReplayInit() != 0) {
+        printf("motion replay thread create failed\r\n");
+    }
+
+    for (;;) {
+        osDelay(AppMsToTicks(1000U));
+    }
+#else
     uint8_t cloudStarted = 0U;
     uint8_t cloudNetworkReadyLogged = 0U;
     uint32_t cloudRetryElapsed = CLOUD_LAUNCH_RETRY_MS;
@@ -101,6 +116,7 @@ static void QstCarTask(void)
             cloudRetryElapsed += 1000U;
         }
     }
+#endif
 }
 
 static void QstCarEntry(void)
