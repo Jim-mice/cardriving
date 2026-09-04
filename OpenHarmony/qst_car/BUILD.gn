@@ -1,5 +1,5 @@
 static_library("qst_car") {
-    motion_replay_only = true
+    motion_replay_only = false
 
     if (motion_replay_only) {
         sources = [
@@ -13,6 +13,8 @@ static_library("qst_car") {
         "qst_car_main.c",
         "src/task_hello.c",
         "src/motion_replay.c",
+        "src/teach_encoder.c",
+        "src/teach_follow.c",
         "src/task_wifi.c",
         "src/wifi_connect.c",
 

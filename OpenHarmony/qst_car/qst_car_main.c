@@ -18,11 +18,12 @@
 #include "udp_telemetry.h"
 #include "task_encoder_cal.h"
 #include "motion_replay.h"
+#include "teach_encoder.h"
+#include "teach_follow.h"
 
 #define WIFI_STA_START_WAIT_MS 6000
 #define CLOUD_VALIDATION_MODE 1
 #define CLOUD_LAUNCH_RETRY_MS 2000U
-#define MOTION_REPLAY_BOOT_MODE 1
 
 /* Low-frequency boot-only allocator diagnostics. LOS_MEM_STATUS.totalSize is
  * the largest contiguous free block in this Hi3861 LiteOS implementation. */
@@ -42,14 +43,21 @@ static void MemBootPublish(const char *stage)
 
 static void QstCarTask(void)
 {
-#if (MOTION_REPLAY_BOOT_MODE == 1)
-    printf("QST motion replay start\r\n");
+#if (TEACH_ENCODER_TEST_MODE == 1)
+    printf("QST teach encoder sampler start\r\n");
     Peripheral_Init();
-    MemBootPublish("MOTION_REPLAY_BOOT");
-
-    if (MotionReplayInit() != 0) {
-        printf("motion replay thread create failed\r\n");
+    MemBootPublish("TEACH_BOOT");
+    TaskWifiInit();
+    if (TaskWifiWaitStaStarted(WIFI_STA_START_WAIT_MS) == 1) {
+        printf("wifi sta started\r\n");
     }
+    UartTask9Init();
+    UdpTelemetryInit();
+    TeachEncoderInit();
+    if (TeachFollowInit() != 0) {
+        printf("teach follow thread create failed\r\n");
+    }
+    printf("teach encoder/follow ready\r\n");
 
     for (;;) {
         osDelay(AppMsToTicks(1000U));

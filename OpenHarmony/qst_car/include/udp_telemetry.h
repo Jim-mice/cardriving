@@ -198,6 +198,9 @@ void UdpTelemetryUpdateMotorCommand(int leftCommand, int rightCommand);
 typedef struct { int16_t leftDelta; int16_t rightDelta; uint8_t sequence; uint32_t validCount; uint32_t badChecksumCount; uint32_t badFrameCount; uint32_t lastRxMs; int32_t totalLeft; int32_t totalRight; } UdpEncoderTelemetryState;
 void UdpTelemetryUpdateEncoder(const UdpEncoderTelemetryState *state);
 void UdpTelemetryReadEncoder(UdpEncoderTelemetryState *state);
+typedef struct { uint32_t timeMs; int32_t left; int32_t right; } UdpTeachPoint;
+int UdpTelemetryQueueTeachPoint(const UdpTeachPoint *point);
+int UdpTelemetryPopTeachPoint(UdpTeachPoint *point);
 void UdpTelemetryPublishCal(const char *text);
 /* Queued experiment text is drained by the low-priority UDP task.  It keeps
  * post-run trajectory dumps out of the 30 ms motor-control task. */

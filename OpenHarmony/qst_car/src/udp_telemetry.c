@@ -9,6 +9,8 @@
 #include "lwip/sockets.h"
 #include "task_car_control.h"
 #include "task_wifi.h"
+#include "teach_encoder.h"
+#include "teach_follow.h"
 #include "udp_telemetry.h"
 #define UDP_TELEMETRY_PORT 5005U
 #define UDP_COMMAND_PORT 7788U
@@ -24,6 +26,7 @@
 #define UDP_REPLAY_EVENT_QUEUE_CAPACITY 16U
 #define UDP_EXPERIMENT_EVENT_QUEUE_CAPACITY 8U
 #define UDP_EXPERIMENT_EVENT_TEXT_SIZE 1536U
+#define UDP_TEACH_POINT_QUEUE_CAPACITY 128U
 
 static volatile uint32_t g_snapshotGeneration;
 static volatile CarTelemetryState g_snapshot;
@@ -65,6 +68,9 @@ static volatile uint32_t g_traceDebugGeneration;
 static volatile UdpTraceDebugState g_traceDebug;
 static volatile uint32_t g_encoderGeneration;
 static volatile UdpEncoderTelemetryState g_encoder;
+static UdpTeachPoint g_teachPointQueue[UDP_TEACH_POINT_QUEUE_CAPACITY];
+static volatile uint32_t g_teachPointHead;
+static volatile uint32_t g_teachPointTail;
 void UdpTelemetryReadEncoder(UdpEncoderTelemetryState *state)
 {
     uint32_t before = g_encoderGeneration;
@@ -431,6 +437,35 @@ void UdpTelemetryUpdateEncoder(const UdpEncoderTelemetryState *state)
     g_encoderGeneration++;
 }
 
+int UdpTelemetryQueueTeachPoint(const UdpTeachPoint *point)
+{
+    uint32_t next;
+
+    if (point == NULL) {
+        return 0;
+    }
+    next = (g_teachPointHead + 1U) % UDP_TEACH_POINT_QUEUE_CAPACITY;
+    if (next == g_teachPointTail) {
+        return 0;
+    }
+    g_teachPointQueue[g_teachPointHead] = *point;
+    g_teachPointHead = next;
+    return 1;
+}
+
+int UdpTelemetryPopTeachPoint(UdpTeachPoint *point)
+{
+    uint32_t index;
+
+    if (point == NULL || g_teachPointTail == g_teachPointHead) {
+        return 0;
+    }
+    index = g_teachPointTail;
+    *point = g_teachPointQueue[index];
+    g_teachPointTail = (index + 1U) % UDP_TEACH_POINT_QUEUE_CAPACITY;
+    return 1;
+}
+
 void UdpTelemetryUpdateAvoid(const UdpAvoidTelemetryState *state)
 {
     UdpAvoidTelemetryState previous;
@@ -662,10 +697,14 @@ static int UdpCommandCreateSocket(void)
 static const char *UdpCommandHandlePayload(const char *payload, int length,
                                            const struct sockaddr_in *sender)
 {
+#if (TEACH_ENCODER_TEST_MODE == 0)
     char rcLine[UDP_COMMAND_RX_BUFFER_SIZE];
     RemoteControlState remote;
     unsigned int seq, admin, ge, le, re, ae;
     int gear, steer;
+#else
+    (void)sender;
+#endif
     if (length > 0 && payload[length - 1] == '\r') {
         length--;
     } else if (length > 0 && payload[length - 1] == '\n') {
@@ -675,13 +714,33 @@ static const char *UdpCommandHandlePayload(const char *payload, int length,
         }
     }
 
+#if (TEACH_ENCODER_TEST_MODE == 0)
     if (length > 0 && length < (int)sizeof(rcLine)) {
         (void)memcpy(rcLine, payload, (size_t)length);
         rcLine[length] = '\0';
     } else {
         rcLine[0] = '\0';
     }
+#endif
 
+    if (length == (int)(sizeof("TEACH START") - 1U) &&
+        memcmp(payload, "TEACH START", sizeof("TEACH START") - 1U) == 0) {
+        TeachEncoderStart();
+        return "OK TEACH START";
+    }
+    if (length == (int)(sizeof("TEACH STOP") - 1U) &&
+        memcmp(payload, "TEACH STOP", sizeof("TEACH STOP") - 1U) == 0) {
+        TeachEncoderStop();
+        return "OK TEACH STOP";
+    }
+    if (length == (int)(sizeof("TEACH FOLLOW") - 1U) &&
+        memcmp(payload, "TEACH FOLLOW", sizeof("TEACH FOLLOW") - 1U) == 0) {
+        return TeachFollowStart() == 0 ? "OK TEACH FOLLOW" : "ERR ENCODER";
+    }
+
+#if (TEACH_ENCODER_TEST_MODE == 1)
+    return "ERR UNKNOWN";
+#else
     if (length > 4 && sscanf(rcLine, "RC1 seq=%u gear=%d steer=%d admin=%u ge=%u le=%u re=%u ae=%u",
                              &seq, &gear, &steer, &admin, &ge, &le, &re, &ae) == 8) {
         if (gear >= -3 && gear <= 3 && steer >= -1 && steer <= 1 && admin <= 1U) {
@@ -839,6 +898,7 @@ static const char *UdpCommandHandlePayload(const char *payload, int length,
         "BPATHCTL event=IGNORE cmd=UDP reason=UNKNOWN");
 #endif
     return "ERR UNKNOWN";
+#endif
 }
 
 static void UdpCommandTask(void *argument)
@@ -912,6 +972,20 @@ static int UdpTelemetrySendEncoder(int socketFd, const struct sockaddr_in *targe
         (unsigned int)state->badChecksumCount, (unsigned int)state->badFrameCount,
         (unsigned int)state->lastRxMs);
     if (textLen < 0 || (unsigned int)textLen >= sizeof(g_udpTelemetryText)) return -1;
+    return (sendto(socketFd, g_udpTelemetryText, (size_t)textLen, 0,
+                   (const struct sockaddr *)target, sizeof(*target)) == textLen) ? 0 : -1;
+}
+
+static int UdpTelemetrySendTeachPoint(int socketFd, const struct sockaddr_in *target,
+                                      const UdpTeachPoint *point)
+{
+    int textLen = snprintf(g_udpTelemetryText, sizeof(g_udpTelemetryText),
+                           "ENC %ld %ld %u\r\n", (long)point->left,
+                           (long)point->right, (unsigned int)point->timeMs);
+
+    if (textLen < 0 || (unsigned int)textLen >= sizeof(g_udpTelemetryText)) {
+        return -1;
+    }
     return (sendto(socketFd, g_udpTelemetryText, (size_t)textLen, 0,
                    (const struct sockaddr *)target, sizeof(*target)) == textLen) ? 0 : -1;
 }
@@ -2082,6 +2156,7 @@ static void UdpTelemetryTask(void *argument)
     UdpReplayTelemetryState replay;
     UdpTraceDebugState traceDebug;
     UdpEncoderTelemetryState encoder;
+    UdpTeachPoint teachPoint;
     uint32_t lastSentSequence = 0U;
     uint32_t lastSensorStatsSequence = 0U;
     uint32_t lastLineCalibrationSequence = 0U;
@@ -2333,13 +2408,23 @@ static void UdpTelemetryTask(void *argument)
             }
         }
 
+        {
+            uint32_t teachSent = 0U;
+
+            while (teachSent < 8U && UdpTelemetryPopTeachPoint(&teachPoint) != 0) {
+                if (UdpTelemetrySendTeachPoint(socketFd, &target, &teachPoint) != 0) {
+                    break;
+                }
+                teachSent++;
+            }
+        }
         UdpTelemetryReadEncoder(&encoder);
-        if (encoder.validCount != lastEncoderValidCount) {
+        if (TEACH_ENCODER_TEST_MODE == 0 && encoder.validCount != lastEncoderValidCount) {
             if (UdpTelemetrySendEncoder(socketFd, &target, "ENC", &encoder) == 0) {
                 lastEncoderValidCount = encoder.validCount;
             }
         }
-        if (encoder.validCount != 0U &&
+        if (TEACH_ENCODER_TEST_MODE == 0 && encoder.validCount != 0U &&
             (uint32_t)(now - lastEncoderHeartbeatTick) >= AppMsToTicks(1000U)) {
             (void)UdpTelemetrySendEncoder(socketFd, &target, "ENC_HEARTBEAT", &encoder);
             lastEncoderHeartbeatTick = now;
